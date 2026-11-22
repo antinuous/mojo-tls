@@ -46,6 +46,7 @@ from net.libc import os_error
 comptime _WANT_READ = -2
 comptime _WANT_WRITE = -3
 comptime _SYSCALL_ERROR = -5
+comptime _WANT_CLIENT_HELLO = -11
 comptime _MAX_PEER_CERT_DER = 1024 * 1024
 comptime _MAX_PEER_NAME = 4096
 comptime _MAX_PEER_SAN_COUNT = 256
@@ -107,9 +108,11 @@ def _shim_error(lib: OwnedDLHandle, var context: String) -> Error:
     return Error(context^)
 
 
-def _server_name(lib: OwnedDLHandle, ssl: UInt64) raises -> String:
+def _name(
+    lib: OwnedDLHandle, function: StaticString, ssl: UInt64
+) raises -> String:
     # The shim returns a NUL-terminated string owned by the SSL object.
-    var address = lib.get_function[UInt64]("mts_ssl_server_name")(ssl)
+    var address = lib.get_function[UInt64](function)(ssl)
     var name = List[Byte]()
     var cursor = Pointer[UInt8, MutUntrackedOrigin](
         unsafe_from_address=Int(address)
@@ -447,6 +450,24 @@ struct TLSContext(Movable):
         """
         self._set_names("mts_ctx_set_h2_names", hosts)
 
+    def hold_client_hellos(self) raises:
+        """Stops every server handshake of this context once, at its
+        ClientHello, until `TLSHandshake.resume()`.
+
+        The pause comes before certificate and ALPN selection, so the
+        caller may change server names and their protocol lists for the
+        name in `TLSHandshake.requested_name()` before the handshake goes
+        on.
+
+        Raises:
+            If this is not a server context.
+        """
+        if not self._is_server:
+            raise Error("tls: client hello holds need a server context")
+        self._lib.get_function[NoneType]("mts_ctx_hold_client_hellos")(
+            self._ctx
+        )
+
     def _set_names(self, function: StaticString, hosts: List[String]) raises:
         if not self._is_server:
             raise Error("tls: server names require a server context")
@@ -693,14 +714,54 @@ struct TLSHandshake(Movable):
         """
         if not self._open:
             raise Error("tls: server name requested after close")
-        return _server_name(self._lib, self._ssl)
+        return _name(self._lib, "mts_ssl_server_name", self._ssl)
+
+    def at_client_hello(self) raises -> Bool:
+        """Reports whether a server handshake waits at its ClientHello.
+
+        Only handshakes of a context that holds client hellos stop there.
+
+        Returns:
+            True from the pause until `resume()`.
+
+        Raises:
+            If the shim symbol cannot be resolved.
+        """
+        return Bool(
+            self._lib.get_function[c_int]("mts_ssl_at_client_hello")(self._ssl)
+        )
+
+    def requested_name(self) raises -> String:
+        """Returns the SNI host name in the ClientHello.
+
+        Returns:
+            The host name from the pause on, or an empty string when the
+            client sent none.
+
+        Raises:
+            If the handshake is closed or the shim symbol cannot be resolved.
+        """
+        if not self._open:
+            raise Error("tls: requested name read after close")
+        return _name(self._lib, "mts_ssl_requested_name", self._ssl)
+
+    def resume(mut self) raises:
+        """Lets the next `advance()` go past the ClientHello.
+
+        Raises:
+            If the handshake is not at its ClientHello.
+        """
+        var rc = self._lib.get_function[c_int]("mts_ssl_resume")(self._ssl)
+        if Int(rc) != 0:
+            raise Error("tls: resume outside a ClientHello pause")
 
     def advance(mut self) raises -> Bool:
         """Performs one handshake step without hiding readiness direction.
 
         Returns:
             True when the TLS handshake is complete, or false when the
-            descriptor must first satisfy `wants_read()` or `wants_write()`.
+            descriptor must first satisfy `wants_read()` or `wants_write()`,
+            or when `at_client_hello()` waits for `resume()`.
 
         Raises:
             On certificate, protocol, or transport failure, including a
@@ -727,6 +788,8 @@ struct TLSHandshake(Movable):
         if Int(rc) == _WANT_READ:
             return False
         if Int(rc) == _WANT_WRITE:
+            return False
+        if Int(rc) == _WANT_CLIENT_HELLO:
             return False
         if Int(rc) == _SYSCALL_ERROR:
             raise os_error("tls handshake")
@@ -999,7 +1062,7 @@ struct TLSStream(ReadinessStream):
         """
         if not self._open:
             raise Error("tls: server name requested after close")
-        return _server_name(self._lib, self._ssl)
+        return _name(self._lib, "mts_ssl_server_name", self._ssl)
 
     def version(self) raises -> String:
         """Returns the negotiated protocol version, e.g. "TLSv1.3".

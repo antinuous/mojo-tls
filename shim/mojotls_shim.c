@@ -67,9 +67,15 @@ typedef struct {
     int h2_names_len;
 } mts_ctx;
 
+/* A server handshake of a context that holds client hellos stops once at
+ * its ClientHello (PAUSED) until mts_ssl_resume (RESUMED). */
+enum { MTS_HELLO_FIRST, MTS_HELLO_PAUSED, MTS_HELLO_RESUMED };
+
 typedef struct {
     SSL *ssl;
     mts_ctx *config;
+    int hello;
+    char requested_name[TLSEXT_MAXLEN_host_name + 1];
 } mts_ssl;
 
 #define MTS_MAX_PEER_CERT_DER (1024 * 1024)
@@ -571,6 +577,49 @@ int mts_ctx_remove_server_name(void *server_ctx, const char *host) {
     return 0;
 }
 
+/* The host_name of the ClientHello's server_name extension (RFC 6066
+ * section 3), or "" when there is none or OpenSSL would refuse it: the
+ * list holds exactly one host_name of printable ASCII. */
+static void mts_hello_name(SSL *ssl, char *out) {
+    const unsigned char *p = NULL;
+    size_t len = 0;
+    out[0] = 0;
+    if (!SSL_client_hello_get0_ext(ssl, TLSEXT_TYPE_server_name, &p, &len))
+        return;
+    if (len < 5) return;
+    size_t list = ((size_t)p[0] << 8) | p[1];
+    if (list != len - 2) return;
+    if (p[2] != TLSEXT_NAMETYPE_host_name) return;
+    size_t name = ((size_t)p[3] << 8) | p[4];
+    if (name != list - 3) return;
+    if (name == 0) return;
+    if (name > TLSEXT_MAXLEN_host_name) return;
+    for (size_t i = 0; i < name; i++) {
+        if (p[5 + i] < 0x21) return;
+        if (p[5 + i] > 0x7e) return;
+    }
+    memcpy(out, p + 5, name);
+    out[name] = 0;
+}
+
+/* Runs before certificate and ALPN selection. libssl calls it again on
+ * every mts_ssl_accept until it succeeds. */
+static int mts_client_hello(SSL *ssl, int *alert, void *arg) {
+    (void)alert;
+    (void)arg;
+    mts_ssl *s = (mts_ssl *)SSL_get_app_data(ssl);
+    if (s->hello == MTS_HELLO_RESUMED) return SSL_CLIENT_HELLO_SUCCESS;
+    if (s->hello == MTS_HELLO_FIRST) {
+        mts_hello_name(ssl, s->requested_name);
+        s->hello = MTS_HELLO_PAUSED;
+    }
+    return SSL_CLIENT_HELLO_RETRY;
+}
+
+void mts_ctx_hold_client_hellos(void *p) {
+    SSL_CTX_set_client_hello_cb(((mts_ctx *)p)->ctx, mts_client_hello, NULL);
+}
+
 void mts_ctx_free(void *p) {
     mts_ctx *c = (mts_ctx *)p;
     mts_ctx_release(c);
@@ -586,6 +635,9 @@ void *mts_ssl_new(void *p, int fd) {
         return NULL;
     }
     s->config = c;
+    s->hello = MTS_HELLO_FIRST;
+    s->requested_name[0] = 0;
+    SSL_set_app_data(s->ssl, s);
     atomic_fetch_add_explicit(&c->refs, 1, memory_order_relaxed);
     SSL_set_mode(s->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE |
                              SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
@@ -789,6 +841,24 @@ const char *mts_ssl_server_name(void *s) {
     const char *name =
         SSL_get_servername(((mts_ssl *)s)->ssl, TLSEXT_NAMETYPE_host_name);
     return name ? name : "";
+}
+
+int mts_ssl_at_client_hello(void *s) {
+    return ((mts_ssl *)s)->hello == MTS_HELLO_PAUSED;
+}
+
+/* The SNI host name read at the ClientHello pause, or "". The string lives
+ * until mts_ssl_free. */
+const char *mts_ssl_requested_name(void *s) {
+    return ((mts_ssl *)s)->requested_name;
+}
+
+/* Lets the next mts_ssl_accept pass the ClientHello; -1 when not paused. */
+int mts_ssl_resume(void *s) {
+    mts_ssl *m = (mts_ssl *)s;
+    if (m->hello != MTS_HELLO_PAUSED) return -1;
+    m->hello = MTS_HELLO_RESUMED;
+    return 0;
 }
 
 int mts_ssl_version(void *s, char *buf, int cap) {
