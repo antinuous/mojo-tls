@@ -737,6 +737,23 @@ struct TLSHandshake(Movable):
         """
         return _received_alert(self._lib, self._ssl)
 
+    def verify_error(self) raises -> Optional[Int]:
+        """Returns why this side refused the peer's certificate, if it did.
+
+        Returns:
+            The OpenSSL X509_V_ERR code, or None while the peer's chain
+            has not failed verification.
+
+        Raises:
+            If the shim symbol cannot be resolved.
+        """
+        var code = Int(
+            self._lib.get_function[Int]("mts_ssl_verify_result")(self._ssl)
+        )
+        if code == 0:
+            return None
+        return code
+
     def wants_read(self) raises -> Bool:
         """Reports whether the next handshake step needs readability.
 
@@ -829,6 +846,11 @@ struct TLSHandshake(Movable):
     def advance(mut self) raises -> Bool:
         """Performs one handshake step without hiding readiness direction.
 
+        A TLS 1.3 client that sent a certificate completes only on the
+        server's first post-handshake record: a session ticket or data
+        accepts it and a fatal alert rejects it, so the rejection is met
+        here rather than on a later read. The server must send tickets.
+
         Returns:
             True when the TLS handshake is complete, or false when the
             descriptor must first satisfy `wants_read()` or `wants_write()`,
@@ -850,6 +872,10 @@ struct TLSHandshake(Movable):
                 var confirm = self._lib.get_function[c_int](
                     "mts_ssl_confirm_connect"
                 )(self._ssl)
+                if Int(confirm) == _WANT_READ:
+                    return False
+                if Int(confirm) == _WANT_WRITE:
+                    return False
                 if Int(confirm) != 0:
                     if Int(confirm) == _SYSCALL_ERROR:
                         raise os_error("tls handshake")

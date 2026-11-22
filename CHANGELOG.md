@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- A TLS 1.3 client that sent a certificate completes its handshake only
+  on the server's first post-handshake record. A session ticket or data
+  accepts it, and a fatal alert rejects it in `advance()` or `connect()`
+  rather than on a later read, where a reset could discard it. This
+  replaces a 50 ms wait for the alert. The server must send session
+  tickets, which mojo-tls servers do. A non-blocking handshake reports
+  `wants_read()` until that record arrives; a blocking one waits within
+  its read timeout.
+- `TLSHandshake.verify_error()` returns the X509 error code when this
+  side refused the peer's certificate, so a caller tells its own
+  rejection from a peer's alert or a closed connection.
+
 - A read that meets the end of the connection with no close_notify
   raises mojo-net's typed `CONNECTION_RESET_ERROR`, as a TCP reset does;
   check it with `is_connection_reset()`. It was the untyped "tls read

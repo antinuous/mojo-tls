@@ -33,12 +33,14 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <strings.h>
 
 #ifdef __linux__
@@ -87,6 +89,10 @@ typedef struct {
     char requested_name[TLSEXT_MAXLEN_host_name + 1];
     /* The description of the last fatal alert the peer sent, or -1. */
     int received_alert;
+    /* A client that wrote its certificate, and one that then received a
+     * session ticket (see mts_ssl_confirm_connect). */
+    int sent_certificate;
+    int ticket_seen;
 } mts_ssl;
 
 #define MTS_MAX_PEER_CERT_DER (1024 * 1024)
@@ -217,6 +223,8 @@ static int mts_alpn_select(SSL *ssl, const unsigned char **out,
     return SSL_TLSEXT_ERR_ALERT_FATAL;
 }
 
+static int mts_ticket_seen(SSL *ssl, SSL_SESSION *session);
+
 void *mts_ctx_new_client(void) {
     mts_ctx *c = calloc(1, sizeof(mts_ctx));
     if (!c) return NULL;
@@ -230,6 +238,7 @@ void *mts_ctx_new_client(void) {
     SSL_CTX_set_min_proto_version(c->ctx, TLS1_2_VERSION);
     /* Resume with a ticket only. Early application data stays off. */
     SSL_CTX_set_session_cache_mode(c->ctx, SSL_SESS_CACHE_CLIENT);
+    SSL_CTX_sess_set_new_cb(c->ctx, mts_ticket_seen);
     SSL_CTX_set_max_early_data(c->ctx, 0);
     return c;
 }
@@ -725,10 +734,21 @@ void mts_ctx_free(void *p) {
  * recorded. TLS 1.3 ignores the level byte on receipt, but every TLS 1.3
  * error alert is sent as fatal (RFC 8446 6.2). */
 static void mts_alert_seen(const SSL *ssl, int where, int ret) {
+    mts_ssl *s = (mts_ssl *)SSL_get_app_data(ssl);
+    if ((where & SSL_CB_LOOP) != 0 && SSL_get_state(ssl) == TLS_ST_CW_CERT &&
+        SSL_get_certificate(ssl) != NULL) {
+        s->sent_certificate = 1;
+    }
     if ((where & SSL_CB_READ_ALERT) == 0) return;
     if ((ret >> 8) != SSL3_AL_FATAL) return;
-    mts_ssl *s = (mts_ssl *)SSL_get_app_data(ssl);
     s->received_alert = ret & 0xff;
+}
+
+static int mts_ticket_seen(SSL *ssl, SSL_SESSION *session) {
+    (void)session;
+    mts_ssl *s = (mts_ssl *)SSL_get_app_data(ssl);
+    s->ticket_seen = 1;
+    return 0;
 }
 
 void *mts_ssl_new(void *p, int fd) {
@@ -806,65 +826,103 @@ int mts_ssl_connect(void *s) {
     return result;
 }
 
-/* TLS 1.3 can report SSL_connect success before a post-handshake alert
- * (rejected client certificate) is processed. Peek without blocking. When
- * this session presented a client certificate on a blocking socket, wait
- * briefly for POLLIN so that alert is not missed. */
-int mts_ssl_confirm_connect(void *s) {
-    SSL *ssl = ((mts_ssl *)s)->ssl;
-    int fd = SSL_get_fd(ssl);
-    if (fd < 0) return -SSL_ERROR_SYSCALL;
+/* TLS 1.3 completes the client handshake before the server judges the
+ * client certificate, and the server sends its session tickets only after
+ * that check passes. So a client that sent a certificate is confirmed by the
+ * server's first post-handshake record: a ticket or application data
+ * accepts, a fatal alert rejects. A blocking socket waits as a blocking read
+ * would, within SO_RCVTIMEO; a non-blocking one reports WANT_READ until the
+ * record arrives. A server that disables tickets never confirms such a
+ * client. */
+static int mts_confirm_step(mts_ssl *s, int awaits_record) {
+    unsigned char buf[1];
+    mts_sigpipe_guard guard;
+    if (mts_sigpipe_guard_begin(&guard) != 0) return -SSL_ERROR_SYSCALL;
+    ERR_clear_error();
+    errno = 0;
+    int n = SSL_peek(s->ssl, buf, 1);
+    int io_errno = errno;
+    int error = n > 0 ? SSL_ERROR_NONE : SSL_get_error(s->ssl, n);
+    mts_sigpipe_guard_end(&guard, io_errno);
+    if (n > 0) return 0;
+    /* close_notify after a completed handshake is a clean EOF; the next
+     * SSL_read reports it again. */
+    if (error == SSL_ERROR_ZERO_RETURN) return 0;
+    if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) {
+        return -error;
+    }
+    if (awaits_record && !s->ticket_seen) return -error;
+    return 0;
+}
 
+static int mts_receive_timeout_ms(int fd, int *timeout_ms) {
+    struct timeval tv;
+    socklen_t len = sizeof(tv);
+    if (getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, &len) != 0) return -1;
+    if (tv.tv_sec == 0 && tv.tv_usec == 0) {
+        *timeout_ms = -1;
+        return 0;
+    }
+    long ms = (long)tv.tv_sec * 1000 + (tv.tv_usec + 999) / 1000;
+    *timeout_ms = ms > INT_MAX ? INT_MAX : (int)ms;
+    return 0;
+}
+
+static long mts_now_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static int mts_await_record(mts_ssl *s, int fd, int timeout_ms) {
+    long deadline_ms = timeout_ms < 0 ? -1 : mts_now_ms() + timeout_ms;
+    int result = mts_confirm_step(s, 1);
+    while (result == -SSL_ERROR_WANT_READ || result == -SSL_ERROR_WANT_WRITE) {
+        int wait_ms = -1;
+        if (deadline_ms >= 0) {
+            long left_ms = deadline_ms - mts_now_ms();
+            if (left_ms <= 0) {
+                errno = EAGAIN;
+                return -SSL_ERROR_SYSCALL;
+            }
+            wait_ms = (int)left_ms;
+        }
+        struct pollfd pfd;
+        memset(&pfd, 0, sizeof(pfd));
+        pfd.fd = fd;
+        pfd.events = result == -SSL_ERROR_WANT_READ ? POLLIN : POLLOUT;
+        int ready = poll(&pfd, 1, wait_ms);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0) return -SSL_ERROR_SYSCALL;
+        if (ready == 0) {
+            errno = EAGAIN;
+            return -SSL_ERROR_SYSCALL;
+        }
+        result = mts_confirm_step(s, 1);
+    }
+    return result;
+}
+
+int mts_ssl_confirm_connect(void *p) {
+    mts_ssl *s = (mts_ssl *)p;
+    int fd = SSL_get_fd(s->ssl);
+    if (fd < 0) return -SSL_ERROR_SYSCALL;
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) return -SSL_ERROR_SYSCALL;
     int blocking = (flags & O_NONBLOCK) == 0;
-    int wait_for_alert = blocking && SSL_get_certificate(ssl) != NULL;
-    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -SSL_ERROR_SYSCALL;
-
-    unsigned char buf[1];
-    int result = 0;
-    int attempts = wait_for_alert ? 2 : 1;
-    int i;
-    for (i = 0; i < attempts; i++) {
-        if (i == 1) {
-            struct pollfd pfd;
-            memset(&pfd, 0, sizeof(pfd));
-            pfd.fd = fd;
-            pfd.events = POLLIN | POLLERR | POLLHUP;
-            int pr = poll(&pfd, 1, 50);
-            if (pr <= 0) break;
-        }
-        mts_sigpipe_guard guard;
-        if (mts_sigpipe_guard_begin(&guard) != 0) {
-            result = -SSL_ERROR_SYSCALL;
-            break;
-        }
-        ERR_clear_error();
-        errno = 0;
-        int n = SSL_peek(ssl, buf, 1);
-        int io_errno = errno;
-        if (n > 0) {
-            result = 0;
-            mts_sigpipe_guard_end(&guard, io_errno);
-            break;
-        }
-        int error = SSL_get_error(ssl, n);
-        mts_sigpipe_guard_end(&guard, io_errno);
-        if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
-            result = 0;
-            continue;
-        }
-        /* close_notify after a completed handshake is a clean EOF; the next
-         * SSL_read reports it again. Only a fatal alert rejects the
-         * session. */
-        if (error == SSL_ERROR_ZERO_RETURN) {
-            result = 0;
-            break;
-        }
-        result = -error;
-        break;
+    int awaits_record =
+        s->sent_certificate && SSL_version(s->ssl) == TLS1_3_VERSION;
+    if (!blocking) return mts_confirm_step(s, awaits_record);
+    int timeout_ms = -1;
+    if (awaits_record && mts_receive_timeout_ms(fd, &timeout_ms) != 0) {
+        return -SSL_ERROR_SYSCALL;
     }
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -SSL_ERROR_SYSCALL;
+    int result = awaits_record ? mts_await_record(s, fd, timeout_ms)
+                               : mts_confirm_step(s, 0);
+    int io_errno = errno;
     (void)fcntl(fd, F_SETFL, flags);
+    errno = io_errno;
     return result;
 }
 
