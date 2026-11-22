@@ -807,7 +807,8 @@ struct TLSHandshake(Movable):
         """Returns the last alert this side sent that refused the session.
 
         The level and version rules match `received_alert()`: close_notify
-        and user_canceled are never recorded.
+        and user_canceled are never recorded. Nor is the decode_error libssl
+        writes when the peer ends the connection, since it refuses no peer.
 
         Returns:
             The alert, or None when this side refused nothing by alert.
@@ -937,7 +938,9 @@ struct TLSHandshake(Movable):
 
         Raises:
             On certificate, protocol, or transport failure, including a
-            post-handshake alert that rejects the client certificate.
+            post-handshake alert that rejects the client certificate. A
+            peer that ends the connection mid-handshake raises
+            `CONNECTION_RESET_ERROR`.
         """
         if self._complete:
             return True
@@ -978,6 +981,8 @@ struct TLSHandshake(Movable):
             return False
         if Int(rc) == _WANT_CLIENT_HELLO:
             return False
+        if Int(rc) == _PEER_CLOSED:
+            raise Error(CONNECTION_RESET_ERROR)
         if Int(rc) == _SYSCALL_ERROR:
             raise os_error("tls handshake")
         raise _shim_error(self._lib, "tls: handshake failed")
@@ -1092,7 +1097,8 @@ struct TLSStream(ReadinessStream):
         """Returns the last alert this side sent that refused the session.
 
         The level and version rules match `received_alert()`: close_notify
-        and user_canceled are never recorded.
+        and user_canceled are never recorded. Nor is the decode_error libssl
+        writes when the peer ends the connection, since it refuses no peer.
 
         Returns:
             The alert, or None when this side refused nothing by alert.

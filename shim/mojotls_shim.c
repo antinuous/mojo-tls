@@ -855,6 +855,20 @@ int mts_ssl_set_connect_name(void *s, const char *sni) {
     return 0;
 }
 
+/* An end of the TCP stream with no close_notify is the peer closing. libssl
+ * answers it with a decode_error alert written to the closed peer; that
+ * alert judges nothing, so it is not kept as sent. */
+static int mts_end_failure(mts_ssl *s, int error) {
+    if (error != SSL_ERROR_SSL) return -error;
+    unsigned long reason = ERR_peek_error();
+    if (ERR_GET_LIB(reason) != ERR_LIB_SSL) return -error;
+    if (ERR_GET_REASON(reason) != SSL_R_UNEXPECTED_EOF_WHILE_READING) {
+        return -error;
+    }
+    s->sent_alert = -1;
+    return -MTS_PEER_CLOSED;
+}
+
 /* SSL_get_error requires the thread error queue to be empty before the I/O
  * call it classifies. Handshake calls return 0 on completion or the negated
  * error class. WANT_READ (-2) and WANT_WRITE (-3) are progress states. */
@@ -866,7 +880,7 @@ int mts_ssl_connect(void *s) {
     errno = 0;
     int n = SSL_connect(ssl);
     int io_errno = errno;
-    int result = n == 1 ? 0 : -SSL_get_error(ssl, n);
+    int result = n == 1 ? 0 : mts_end_failure(s, SSL_get_error(ssl, n));
     mts_sigpipe_guard_end(&guard, io_errno);
     return result;
 }
@@ -952,11 +966,7 @@ static int mts_verdict_failure(mts_ssl *s, int error, int io_errno) {
     }
     /* SSL_peek on a completed client handshake reports no other class. */
     if (error != SSL_ERROR_SSL) abort();
-    unsigned long reason = ERR_peek_error();
-    if (ERR_GET_LIB(reason) == ERR_LIB_SSL &&
-        ERR_GET_REASON(reason) == SSL_R_UNEXPECTED_EOF_WHILE_READING) {
-        return -MTS_PEER_CLOSED;
-    }
+    if (mts_end_failure(s, error) == -MTS_PEER_CLOSED) return -MTS_PEER_CLOSED;
     return -MTS_PROTOCOL;
 }
 
@@ -1063,21 +1073,15 @@ int mts_ssl_accept(void *s) {
     errno = 0;
     int n = SSL_accept(ssl);
     int io_errno = errno;
-    int result = n == 1 ? 0 : -SSL_get_error(ssl, n);
+    int result = n == 1 ? 0 : mts_end_failure(s, SSL_get_error(ssl, n));
     mts_sigpipe_guard_end(&guard, io_errno);
     return result;
 }
 
-static int mts_read_failure(SSL *ssl, int n) {
-    int error = SSL_get_error(ssl, n);
+static int mts_read_failure(mts_ssl *s, int n) {
+    int error = SSL_get_error(s->ssl, n);
     if (error == SSL_ERROR_ZERO_RETURN) return 0;
-    if (error != SSL_ERROR_SSL) return -error;
-    unsigned long reason = ERR_peek_error();
-    if (ERR_GET_LIB(reason) != ERR_LIB_SSL) return -error;
-    if (ERR_GET_REASON(reason) != SSL_R_UNEXPECTED_EOF_WHILE_READING) {
-        return -error;
-    }
-    return -MTS_PEER_CLOSED;
+    return mts_end_failure(s, error);
 }
 
 /* Returns bytes read (> 0), 0 on clean TLS EOF (close_notify),
@@ -1091,7 +1095,7 @@ int mts_ssl_read(void *s, unsigned char *buf, int len) {
     errno = 0;
     int n = SSL_read(ssl, buf, len);
     int io_errno = errno;
-    int result = n > 0 ? n : mts_read_failure(ssl, n);
+    int result = n > 0 ? n : mts_read_failure((mts_ssl *)s, n);
     mts_sigpipe_guard_end(&guard, io_errno);
     return result;
 }

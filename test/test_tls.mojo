@@ -610,6 +610,41 @@ def test_a_user_canceled_alert_is_not_recorded() raises:
     peer.close()
 
 
+def test_a_peer_that_ends_the_handshake_is_a_typed_reset() raises:
+    # A raw TCP peer reads the ClientHello and shuts down its write side
+    # with no alert; the client steps only after both, so its step meets
+    # the end of the stream and refuses nothing.
+    var listener = TCPListener("127.0.0.1", 0)
+    var client_tcp = TCPStream.connect("127.0.0.1", listener.local_port)
+    var peer = listener.accept()
+    listener.close()
+    client_tcp.set_nonblocking(True)
+    var client_ctx = TLSContext.client(ca_file=String(CA))
+    var client = client_ctx.start_connect(client_tcp^, "localhost")
+    assert_false(client.advance(), "the client waits for the server")
+    await_readable(peer.descriptor())
+    var hello = List[Byte](length=16384, fill=0)
+    assert_true(peer.read(hello) > 0, "the ClientHello arrives")
+    comptime SHUT_WR = 1
+    assert_equal(
+        external_call["shutdown", c_int](peer.descriptor(), c_int(SHUT_WR)),
+        0,
+    )
+    var reset = False
+    for _ in range(16):
+        await_readable(client.descriptor())
+        try:
+            assert_false(client.advance(), "no ServerHello arrives")
+        except error:
+            assert_true(is_connection_reset(error), String(error))
+            reset = True
+            break
+    assert_true(reset, "the end of the stream ends the handshake")
+    assert_false(Bool(client.received_alert()), "the peer sent no alert")
+    assert_false(Bool(client.sent_alert()), "the client refused nothing")
+    peer.close()
+
+
 def test_reject_untrusted_client_certificate() raises:
     var server = fork_tls_echo_server(
         SERVER_CERT,
@@ -690,6 +725,7 @@ def test_end_without_close_notify_is_a_typed_reset() raises:
         assert_true(is_connection_reset(error), String(error))
         reset = True
     assert_true(reset, "an end without close_notify is not a clean EOF")
+    assert_false(Bool(stream.sent_alert()), "the client refused nothing")
     stream.close()
     reap(pid)
 
@@ -1439,6 +1475,7 @@ def main() raises:
     test_alert_after_the_handshake_is_received_on_read()
     test_an_alert_is_sent_by_one_side_and_received_by_the_other()
     test_a_user_canceled_alert_is_not_recorded()
+    test_a_peer_that_ends_the_handshake_is_a_typed_reset()
     test_reject_untrusted_client_certificate()
     test_certificate_client_completes_on_the_ticket()
     test_certificate_client_reads_the_alert_before_the_reset()

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- A handshake step that meets the peer's end of the connection raises
+  `CONNECTION_RESET_ERROR`, as a read does; it raised a generic handshake
+  failure. The decode_error alert libssl writes to the closed peer on any
+  such end is not recorded by `sent_alert()`, so a peer that went away
+  never reads as this side's refusal.
 - `sent_alert()` on `TLSHandshake` and `TLSStream` returns the last alert
   this side sent that refused the session, under the same rules as
   `received_alert()`, so a server tells its own refusal of a client (for
