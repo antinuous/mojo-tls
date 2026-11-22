@@ -38,7 +38,7 @@ from .tls import (
     PROTOCOL_ERROR,
     REJECTED_ERROR,
     SubjectAlternativeNames,
-    TLSAlert,
+    TLSEnd,
     TLSContext,
     TLSHandshake,
     TLSSession,

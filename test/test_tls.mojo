@@ -4,6 +4,7 @@
 # typed WANT_READ and WANT_WRITE states, and clean EOF.
 
 from std.ffi import c_int, external_call
+from std.sys import CompilationTarget
 from std.time import perf_counter_ns
 from std.testing import assert_equal, assert_false, assert_true
 
@@ -20,7 +21,7 @@ from net import (
 from tls import (
     PeerCertificate,
     REJECTED_ERROR,
-    TLSAlert,
+    TLSEnd,
     TLSContext,
     TLSHandshake,
     TLSSession,
@@ -201,7 +202,7 @@ def test_required_client_certificate() raises:
     assert_equal(stream.negotiated_alpn(), "h2")
     stream.write_all("auth".as_bytes())
     assert_equal(String(from_utf8=stream.read_exact(4)), "auth")
-    assert_false(Bool(stream.received_alert()), "no alert on a good session")
+    assert_false(Bool(stream.end_cause()), "a good session stands")
     stream.close()
     reap(server[1])
 
@@ -220,6 +221,11 @@ def step_until_done(mut handshake: TLSHandshake) raises:
         if handshake.advance():
             return
     assert_true(False, "the handshake step completes")
+
+
+def assert_end(end: Optional[TLSEnd], kind: UInt8, alert: UInt8) raises:
+    assert_true(Bool(end), "the session has ended")
+    assert_equal(end.value(), TLSEnd(kind, alert))
 
 
 def step_until_error(mut handshake: TLSHandshake) raises -> String:
@@ -266,9 +272,8 @@ def test_alert_in_the_handshake_is_received() raises:
     assert_false(client.advance(), "the client waits for the server")
     step_until_raises(server)
     step_until_raises(client)
-    var alert = client.received_alert()
-    assert_true(Bool(alert), "the failed handshake carries the alert")
-    assert_equal(alert.value(), TLSAlert(120))
+    assert_end(server.end_cause(), TLSEnd.local_alert, 120)
+    assert_end(client.end_cause(), TLSEnd.peer_alert, 120)
 
 
 def test_alert_after_the_handshake_is_received_on_read() raises:
@@ -295,7 +300,7 @@ def test_alert_after_the_handshake_is_received_on_read() raises:
     await_readable(server.descriptor())
     assert_false(server.advance(), "the server waits for the client")
     step_until_done(client)
-    assert_false(Bool(client.received_alert()), "no alert yet")
+    assert_false(Bool(client.end_cause()), "the client has not ended")
     step_until_raises(server)
     var stream = client^.finish()
     await_readable(stream.descriptor())
@@ -307,9 +312,8 @@ def test_alert_after_the_handshake_is_received_on_read() raises:
     except:
         read_raised = True
     assert_true(read_raised, "the first read meets the alert")
-    var alert = stream.received_alert()
-    assert_true(Bool(alert), "the rejection is a received alert")
-    assert_equal(alert.value(), TLSAlert.certificate_required)
+    assert_end(server.end_cause(), TLSEnd.local_alert, 116)
+    assert_end(stream.end_cause(), TLSEnd.peer_alert, 116)
     stream.close()
 
 
@@ -377,8 +381,8 @@ def test_certificate_client_completes_on_the_ticket() raises:
     step_to_the_judgement(client, server)
     step_until_done(server)
     step_until_done(client)
-    assert_false(Bool(client.received_alert()), "an accepted client")
-    assert_false(Bool(server.verify_error()), "the server verified it")
+    assert_false(Bool(client.end_cause()), "an accepted client")
+    assert_false(Bool(server.end_cause()), "the server verified it")
     var stream = client^.finish()
     var peer = server^.finish()
     stream.write_all("ok".as_bytes())
@@ -409,15 +413,8 @@ def test_certificate_client_reads_the_alert_before_the_reset() raises:
     step_until_raises(server)
     var error = step_until_error(client)
     assert_equal(error, REJECTED_ERROR)
-    var alert = client.received_alert()
-    assert_true(Bool(alert), "the rejection is a received alert")
-    assert_equal(alert.value(), TLSAlert.unknown_ca)
-    assert_true(Bool(server.verify_error()), "the server refused the chain")
-    assert_false(Bool(client.verify_error()), "the client refused nothing")
-    var sent = server.sent_alert()
-    assert_true(Bool(sent), "the refusing server records its alert as sent")
-    assert_equal(sent.value(), TLSAlert.unknown_ca)
-    assert_false(Bool(client.sent_alert()), "the refused client sent none")
+    assert_end(client.end_cause(), TLSEnd.peer_alert, 48)
+    assert_end(server.end_cause(), TLSEnd.local_alert, 48)
     _ = server^
 
 
@@ -439,7 +436,7 @@ def test_certificate_client_meets_a_reset_with_nothing_readable() raises:
     _ = server^
     var error = step_until_error(client)
     assert_equal(error, CONNECTION_RESET_ERROR)
-    assert_false(Bool(client.received_alert()), "a close is not an alert")
+    assert_end(client.end_cause(), TLSEnd.peer_reset, 0)
 
 
 def await_hangup(fd: c_int) raises:
@@ -479,8 +476,7 @@ def test_certificate_client_takes_the_ticket_and_close_in_one_read() raises:
     var stream = client^.finish()
     var buf = List[Byte](length=16, fill=0)
     assert_equal(stream.read(buf), 0, "close_notify reads as clean EOF")
-    assert_false(Bool(stream.received_alert()), "close_notify is no rejection")
-    assert_false(Bool(stream.sent_alert()), "the client refused nothing")
+    assert_end(stream.end_cause(), TLSEnd.peer_closed, 0)
     stream.close()
 
 
@@ -503,7 +499,7 @@ def test_certificate_client_fails_when_the_server_ends_with_a_fin() raises:
     )
     var error = step_until_error(client)
     assert_equal(error, CONNECTION_RESET_ERROR)
-    assert_false(Bool(client.received_alert()), "a close is not an alert")
+    assert_end(client.end_cause(), TLSEnd.peer_closed, 0)
     assert_false(server.is_complete(), "the server never judged")
 
 
@@ -551,8 +547,7 @@ def test_certificate_client_times_out_without_a_verdict() raises:
 
 def test_an_alert_is_sent_by_one_side_and_received_by_the_other() raises:
     # The client refuses a self-signed server certificate and sends the
-    # fatal alert: the client records it as sent only, the server as
-    # received only.
+    # fatal alert: a local alert at the client, a peer alert at the server.
     var listener = TCPListener("127.0.0.1", 0)
     var client_tcp = TCPStream.connect("127.0.0.1", listener.local_port)
     var server_tcp = listener.accept()
@@ -569,23 +564,20 @@ def test_an_alert_is_sent_by_one_side_and_received_by_the_other() raises:
     await_readable(server.descriptor())
     assert_false(server.advance(), "the server waits for the client")
     step_until_raises(client)
-    assert_true(Bool(client.verify_error()), "the client refused the chain")
-    assert_false(Bool(client.received_alert()), "a sent alert is not received")
-    var sent = client.sent_alert()
-    assert_true(Bool(sent), "the client records the alert it sent")
-    assert_equal(sent.value(), TLSAlert.unknown_ca)
+    assert_end(client.end_cause(), TLSEnd.local_alert, 48)
     step_until_raises(server)
-    var alert = server.received_alert()
-    assert_true(Bool(alert), "the server received the client's alert")
-    assert_equal(alert.value(), TLSAlert.unknown_ca)
-    assert_false(Bool(server.sent_alert()), "a received alert is not sent")
+    assert_end(server.end_cause(), TLSEnd.peer_alert, 48)
 
 
-def test_a_user_canceled_alert_is_not_recorded() raises:
-    # A raw TCP peer reads the ClientHello, writes a plaintext fatal-level
-    # user_canceled record, then shuts down its write side; the client
-    # steps only after both, before any ServerHello fixes the version, so
-    # only the description rule keeps the alert from being recorded.
+@fieldwise_init
+struct RawPeer(Movable):
+    var client: TLSHandshake
+    var peer: TCPStream
+
+
+def raw_peer_after_hello() raises -> RawPeer:
+    # Returns a non-blocking client that has sent its ClientHello and a raw
+    # TCP peer that has read it, so the peer acts before the client steps.
     var listener = TCPListener("127.0.0.1", 0)
     var client_tcp = TCPStream.connect("127.0.0.1", listener.local_port)
     var peer = listener.accept()
@@ -597,52 +589,101 @@ def test_a_user_canceled_alert_is_not_recorded() raises:
     await_readable(peer.descriptor())
     var hello = List[Byte](length=16384, fill=0)
     assert_true(peer.read(hello) > 0, "the ClientHello arrives")
-    var alert: List[Byte] = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x5A]
-    peer.write_all(alert)
-    comptime SHUT_WR = 1
-    assert_equal(
-        external_call["shutdown", c_int](peer.descriptor(), c_int(SHUT_WR)),
-        0,
-    )
-    step_until_raises(client)
-    assert_false(Bool(client.received_alert()), "user_canceled is no refusal")
-    assert_false(Bool(client.sent_alert()), "the client refused nothing")
-    peer.close()
+    return RawPeer(client^, peer^)
 
 
-def test_a_peer_that_ends_the_handshake_is_a_typed_reset() raises:
-    # A raw TCP peer reads the ClientHello and shuts down its write side
-    # with no alert; the client steps only after both, so its step meets
-    # the end of the stream and refuses nothing.
-    var listener = TCPListener("127.0.0.1", 0)
-    var client_tcp = TCPStream.connect("127.0.0.1", listener.local_port)
-    var peer = listener.accept()
-    listener.close()
-    client_tcp.set_nonblocking(True)
-    var client_ctx = TLSContext.client(ca_file=String(CA))
-    var client = client_ctx.start_connect(client_tcp^, "localhost")
-    assert_false(client.advance(), "the client waits for the server")
-    await_readable(peer.descriptor())
-    var hello = List[Byte](length=16384, fill=0)
-    assert_true(peer.read(hello) > 0, "the ClientHello arrives")
-    comptime SHUT_WR = 1
-    assert_equal(
-        external_call["shutdown", c_int](peer.descriptor(), c_int(SHUT_WR)),
-        0,
-    )
-    var reset = False
+def step_until_typed_error(mut handshake: TLSHandshake) raises -> Error:
     for _ in range(16):
-        await_readable(client.descriptor())
+        await_readable(handshake.descriptor())
         try:
-            assert_false(client.advance(), "no ServerHello arrives")
+            assert_false(handshake.advance(), "the handshake does not finish")
         except error:
-            assert_true(is_connection_reset(error), String(error))
-            reset = True
-            break
-    assert_true(reset, "the end of the stream ends the handshake")
-    assert_false(Bool(client.received_alert()), "the peer sent no alert")
-    assert_false(Bool(client.sent_alert()), "the client refused nothing")
+            return error
+    assert_true(False, "the handshake step raises")
+    return Error()
+
+
+def shut_write(peer: TCPStream) raises:
+    comptime SHUT_WR = 1
+    assert_equal(
+        external_call["shutdown", c_int](peer.descriptor(), c_int(SHUT_WR)),
+        0,
+    )
+
+
+def test_a_peer_alert_before_the_end_ends_the_handshake() raises:
+    # The raw peer writes a plaintext fatal handshake_failure record and
+    # then its FIN before the client steps, so the alert is met first.
+    var pair = raw_peer_after_hello()
+    var alert: List[Byte] = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]
+    pair.peer.write_all(alert)
+    shut_write(pair.peer)
+    _ = step_until_typed_error(pair.client)
+    assert_end(pair.client.end_cause(), TLSEnd.peer_alert, 40)
+    pair.peer.close()
+
+
+def test_a_peer_reset_ends_the_handshake() raises:
+    # The raw peer closes with a zero linger, which sends a reset in place
+    # of a FIN, before the client steps.
+    var pair = raw_peer_after_hello()
+    comptime macos = CompilationTarget.is_macos()
+    comptime SOL_SOCKET = 0xFFFF if macos else 1
+    comptime SO_LINGER = 0x80 if macos else 13
+    var linger: List[c_int] = [1, 0]
+    assert_equal(
+        external_call["setsockopt", c_int](
+            pair.peer.descriptor(),
+            c_int(SOL_SOCKET),
+            c_int(SO_LINGER),
+            linger.unsafe_ptr(),
+            c_int(8),
+        ),
+        0,
+    )
+    pair.peer.close()
+    var error = step_until_typed_error(pair.client)
+    assert_true(String(error).find("reset") >= 0, String(error))
+    assert_end(pair.client.end_cause(), TLSEnd.peer_reset, 0)
+
+
+def test_a_local_alert_before_the_peer_end_stands() raises:
+    # A raw client writes a handshake record that is no ClientHello; the
+    # server's step refuses it with an alert, and only then does the raw
+    # client end the stream, so the server's first end is its own alert.
+    var listener = TCPListener("127.0.0.1", 0)
+    var peer = TCPStream.connect("127.0.0.1", listener.local_port)
+    var server_tcp = listener.accept()
+    listener.close()
+    server_tcp.set_nonblocking(True)
+    var server_ctx = TLSContext.server(String(SERVER_CERT), String(SERVER_KEY))
+    var server = server_ctx.start_accept(server_tcp^)
+    var record: List[Byte] = [
+        0x16, 0x03, 0x01, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00
+    ]
+    peer.write_all(record)
+    _ = step_until_typed_error(server)
+    var end = server.end_cause()
+    assert_true(Bool(end), "the server has ended")
+    assert_equal(end.value().kind, TLSEnd.local_alert)
+    shut_write(peer)
+    try:
+        _ = server.advance()
+    except:
+        pass
+    assert_equal(server.end_cause().value(), end.value(), "the first end stands")
     peer.close()
+
+
+def test_a_peer_end_before_the_local_alert_is_a_close() raises:
+    # The raw peer ends the stream with no alert before the client steps.
+    # libssl then writes decode_error to the closed peer, after the end.
+    var pair = raw_peer_after_hello()
+    shut_write(pair.peer)
+    var error = step_until_typed_error(pair.client)
+    assert_true(is_connection_reset(error), String(error))
+    assert_end(pair.client.end_cause(), TLSEnd.peer_closed, 0)
+    pair.peer.close()
 
 
 def test_reject_untrusted_client_certificate() raises:
@@ -670,9 +711,7 @@ def test_reject_untrusted_client_certificate() raises:
         raised = True
         assert_true(is_rejection(e), String(e))
     assert_true(raised, "untrusted client certificate must fail connect")
-    var alert = handshake.received_alert()
-    assert_true(Bool(alert), "the blocking connect meets the alert")
-    assert_equal(alert.value(), TLSAlert.unknown_ca)
+    assert_end(handshake.end_cause(), TLSEnd.peer_alert, 48)
     reap(server[1])
 
 
@@ -725,7 +764,7 @@ def test_end_without_close_notify_is_a_typed_reset() raises:
         assert_true(is_connection_reset(error), String(error))
         reset = True
     assert_true(reset, "an end without close_notify is not a clean EOF")
-    assert_false(Bool(stream.sent_alert()), "the client refused nothing")
+    assert_end(stream.end_cause(), TLSEnd.peer_closed, 0)
     stream.close()
     reap(pid)
 
@@ -1474,8 +1513,10 @@ def main() raises:
     test_alert_in_the_handshake_is_received()
     test_alert_after_the_handshake_is_received_on_read()
     test_an_alert_is_sent_by_one_side_and_received_by_the_other()
-    test_a_user_canceled_alert_is_not_recorded()
-    test_a_peer_that_ends_the_handshake_is_a_typed_reset()
+    test_a_peer_alert_before_the_end_ends_the_handshake()
+    test_a_peer_reset_ends_the_handshake()
+    test_a_local_alert_before_the_peer_end_stands()
+    test_a_peer_end_before_the_local_alert_is_a_close()
     test_reject_untrusted_client_certificate()
     test_certificate_client_completes_on_the_ticket()
     test_certificate_client_reads_the_alert_before_the_reset()

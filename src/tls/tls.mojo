@@ -88,7 +88,7 @@ comptime REJECTED_ERROR = "tls: the peer rejected the handshake"
 
 Raised by a client context built with `server_tickets_after_verify` when
 the server's verdict on its certificate is an alert; read the alert with
-`received_alert()`. Check it with `is_rejection()`.
+`end_cause()`. Check it with `is_rejection()`.
 """
 
 
@@ -247,60 +247,66 @@ struct PeerCertificate(Copyable, Movable):
 
 
 @fieldwise_init
-struct TLSAlert(Equatable, ImplicitlyCopyable, Movable, Writable):
-    """A fatal alert the peer sent, by its RFC 8446 description code.
+struct TLSEnd(Equatable, ImplicitlyCopyable, Movable, Writable):
+    """What ended a TLS session.
 
-    A session records the last one it received. After a handshake step,
-    read or write raises, `received_alert()` tells a peer's rejection
-    (such as `certificate_required` for a missing client certificate) from
-    a transport failure. Warning-level alerts are not recorded.
+    The session decides it once, when the handshake step, read or write
+    that met the end returns, and the first end stands. A peer's TCP end
+    is `peer_closed` even though libssl then writes decode_error to the
+    closed peer. A fatal alert names its description in `alert`.
     """
 
-    var code: UInt8
-    """The alert description, RFC 8446 section 6."""
+    var kind: UInt8
+    """One of the kinds below."""
+    var alert: UInt8
+    """The alert description for `peer_alert` and `local_alert`, else 0."""
 
-    comptime bad_certificate = TLSAlert(42)
-    """The peer rejected the certificate as corrupt or unverifiable."""
-    comptime unsupported_certificate = TLSAlert(43)
-    """The peer does not support the certificate's type."""
-    comptime certificate_revoked = TLSAlert(44)
-    """The certificate was revoked by its signer."""
-    comptime certificate_expired = TLSAlert(45)
-    """The certificate has expired or is not yet valid."""
-    comptime certificate_unknown = TLSAlert(46)
-    """The peer could not accept the certificate for another reason."""
-    comptime unknown_ca = TLSAlert(48)
-    """The peer does not trust the certificate's issuer."""
-    comptime certificate_required = TLSAlert(116)
-    """The server required a client certificate and got none."""
+    comptime peer_closed: UInt8 = 1
+    """The peer ended the stream, with or without close_notify."""
+    comptime peer_reset: UInt8 = 2
+    """The peer reset the connection."""
+    comptime peer_alert: UInt8 = 3
+    """The peer sent a fatal alert."""
+    comptime local_alert: UInt8 = 4
+    """This side refused the peer with a fatal alert."""
+    comptime local_failure: UInt8 = 5
+    """This side failed with no alert written."""
 
     def __eq__(self, other: Self) -> Bool:
-        """Compares alert codes.
+        """Compares kind and alert.
 
         Args:
-            other: The alert to compare with.
+            other: The end to compare with.
 
         Returns:
-            True when both name the same description code.
+            True when both name the same kind and alert.
         """
-        return self.code == other.code
+        return self.kind == other.kind and self.alert == other.alert
 
     def write_to(self, mut writer: Some[Writer]):
-        """Writes the alert as `tls alert <code>`.
+        """Writes the end, as `peer alert 116` or `peer closed`.
 
         Args:
             writer: The destination.
         """
-        writer.write("tls alert ", self.code)
+        if self.kind == Self.peer_closed:
+            writer.write("peer closed")
+        elif self.kind == Self.peer_reset:
+            writer.write("peer reset")
+        elif self.kind == Self.peer_alert:
+            writer.write("peer alert ", self.alert)
+        elif self.kind == Self.local_alert:
+            writer.write("local alert ", self.alert)
+        else:
+            writer.write("local failure")
 
 
-def _alert(
-    lib: OwnedDLHandle, symbol: StaticString, ssl: UInt64
-) raises -> Optional[TLSAlert]:
-    var code = Int(lib.get_function[c_int](symbol)(ssl))
-    if code < 0:
+def _end(lib: OwnedDLHandle, ssl: UInt64) raises -> Optional[TLSEnd]:
+    var kind = Int(lib.get_function[c_int]("mts_ssl_end_kind")(ssl))
+    if kind == 0:
         return None
-    return TLSAlert(UInt8(code))
+    var alert = Int(lib.get_function[c_int]("mts_ssl_end_alert")(ssl))
+    return TLSEnd(UInt8(kind), UInt8(max(alert, 0)))
 
 
 @fieldwise_init
@@ -792,48 +798,16 @@ struct TLSHandshake(Movable):
         """
         return self._tcp.descriptor()
 
-    def received_alert(self) raises -> Optional[TLSAlert]:
-        """Returns the last fatal alert the peer sent, if any.
+    def end_cause(self) raises -> Optional[TLSEnd]:
+        """Returns what ended the session, once a call has met its end.
 
         Returns:
-            The alert, or None when the peer sent no fatal alert.
+            The end, or None while the session stands.
 
         Raises:
             If the shim symbol cannot be resolved.
         """
-        return _alert(self._lib, "mts_ssl_received_alert", self._ssl)
-
-    def sent_alert(self) raises -> Optional[TLSAlert]:
-        """Returns the last alert this side sent that refused the session.
-
-        The level and version rules match `received_alert()`: close_notify
-        and user_canceled are never recorded. Nor is the decode_error libssl
-        writes when the peer ends the connection, since it refuses no peer.
-
-        Returns:
-            The alert, or None when this side refused nothing by alert.
-
-        Raises:
-            If the shim symbol cannot be resolved.
-        """
-        return _alert(self._lib, "mts_ssl_sent_alert", self._ssl)
-
-    def verify_error(self) raises -> Optional[Int]:
-        """Returns why this side refused the peer's certificate chain.
-
-        Returns:
-            The OpenSSL X509_V_ERR code, or None while no chain has failed
-            verification, which includes a peer that sent no certificate.
-
-        Raises:
-            If the shim symbol cannot be resolved.
-        """
-        var code = Int(
-            self._lib.get_function[Int]("mts_ssl_verify_result")(self._ssl)
-        )
-        if code == 0:
-            return None
-        return code
+        return _end(self._lib, self._ssl)
 
     def wants_read(self) raises -> Bool:
         """Reports whether the next handshake step needs readability.
@@ -1082,31 +1056,16 @@ struct TLSStream(ReadinessStream):
         """
         self._tcp.set_nonblocking(enabled)
 
-    def received_alert(self) raises -> Optional[TLSAlert]:
-        """Returns the last fatal alert the peer sent, if any.
+    def end_cause(self) raises -> Optional[TLSEnd]:
+        """Returns what ended the session, once a call has met its end.
 
         Returns:
-            The alert, or None when the peer sent no fatal alert.
+            The end, or None while the session stands.
 
         Raises:
             If the shim symbol cannot be resolved.
         """
-        return _alert(self._lib, "mts_ssl_received_alert", self._ssl)
-
-    def sent_alert(self) raises -> Optional[TLSAlert]:
-        """Returns the last alert this side sent that refused the session.
-
-        The level and version rules match `received_alert()`: close_notify
-        and user_canceled are never recorded. Nor is the decode_error libssl
-        writes when the peer ends the connection, since it refuses no peer.
-
-        Returns:
-            The alert, or None when this side refused nothing by alert.
-
-        Raises:
-            If the shim symbol cannot be resolved.
-        """
-        return _alert(self._lib, "mts_ssl_sent_alert", self._ssl)
+        return _end(self._lib, self._ssl)
 
     def wants_read(self) raises -> Bool:
         """Reports whether the blocked TLS operation needs readability.

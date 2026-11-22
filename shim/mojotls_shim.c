@@ -85,24 +85,33 @@ typedef struct {
  * its ClientHello (PAUSED) until mts_ssl_resume (RESUMED). */
 enum { MTS_HELLO_FIRST, MTS_HELLO_PAUSED, MTS_HELLO_RESUMED };
 
+/* What ended a session (see mts_end_decide). */
+enum {
+    MTS_END_NONE,
+    MTS_END_PEER_CLOSED,
+    MTS_END_PEER_RESET,
+    MTS_END_PEER_ALERT,
+    MTS_END_LOCAL_ALERT,
+    MTS_END_LOCAL_FAILURE
+};
+
 typedef struct {
     SSL *ssl;
     mts_ctx *config;
     int hello;
     char requested_name[TLSEXT_MAXLEN_host_name + 1];
-    /* The description of the last alert the peer sent, and of the last
-     * alert this side sent, that refused the session, or -1 (see
-     * mts_alert_kept). */
-    int received_alert;
-    int sent_alert;
+    /* What ended the session and its alert description, or -1; decided
+     * once (see mts_end_decide). */
+    int end_kind;
+    int end_alert;
+    /* The fatal alert this side wrote, or -1. libssl writes one only as
+     * the call that wrote it fails. */
+    int alert_written;
     /* A client with a certificate configured that answered a certificate
      * request, and one that then received a session ticket (see
      * mts_ssl_confirm_connect). */
     int sent_certificate;
     int ticket_seen;
-    /* The hello that fixes the version has been processed; before it a
-     * client's SSL_version is the highest it offers. */
-    int version_fixed;
 } mts_ssl;
 
 #define MTS_MAX_PEER_CERT_DER (1024 * 1024)
@@ -753,39 +762,64 @@ void mts_ctx_free(void *p) {
     mts_ctx_release(c);
 }
 
-/* The description of an alert that refuses the session, or -1. close_notify
- * and user_canceled end a session without refusing it. TLS 1.2, and any
- * session before its version is fixed, acts only on fatal alerts. TLS 1.3
- * ignores the level byte (RFC 8446 6) and fails on every other alert. */
-static int mts_alert_kept(const SSL *ssl, const mts_ssl *s, int ret) {
-    int level = ret >> 8;
-    int description = ret & 0xff;
-    if (description == SSL_AD_CLOSE_NOTIFY) return -1;
-    if (description == SSL_AD_USER_CANCELLED) return -1;
-    int tls13 = s->version_fixed && SSL_version(ssl) == TLS1_3_VERSION;
-    if (level != SSL3_AL_FATAL && !tls13) return -1;
-    return description;
-}
-
 static void mts_alert_seen(const SSL *ssl, int where, int ret) {
     mts_ssl *s = (mts_ssl *)SSL_get_app_data(ssl);
     if ((where & SSL_CB_LOOP) != 0 && SSL_get_state(ssl) == TLS_ST_CW_CERT &&
         SSL_get_certificate(ssl) != NULL) {
         s->sent_certificate = 1;
     }
-    if ((where & SSL_CB_LOOP) != 0 &&
-        (SSL_get_state(ssl) == TLS_ST_CR_SRVR_HELLO ||
-         SSL_get_state(ssl) == TLS_ST_SR_CLNT_HELLO)) {
-        s->version_fixed = 1;
+    if ((where & SSL_CB_WRITE_ALERT) != SSL_CB_WRITE_ALERT) return;
+    if ((ret >> 8) != SSL3_AL_FATAL) return;
+    s->alert_written = ret & 0xff;
+}
+
+/* Decides what ended the session when a call fails; the first end decided
+ * stands. libssl queues SSL_AD_REASON_OFFSET plus the description for a
+ * fatal alert it received, and SSL_R_UNEXPECTED_EOF_WHILE_READING for a TCP
+ * end without close_notify. After that end it writes decode_error to the
+ * closed peer, which ends nothing, so the call's first queued reason is
+ * read before any alert this side wrote. A class that is no end (WANT_*,
+ * a timeout) decides nothing. */
+static void mts_end_decide(mts_ssl *s, int error, int io_errno) {
+    if (s->end_kind != MTS_END_NONE) return;
+    int kind = MTS_END_NONE;
+    int alert = -1;
+    if (error == SSL_ERROR_ZERO_RETURN) kind = MTS_END_PEER_CLOSED;
+    if (error == SSL_ERROR_SYSCALL && io_errno == 0) {
+        kind = MTS_END_PEER_CLOSED;
     }
-    int kept = mts_alert_kept(ssl, s, ret);
-    if (kept < 0) return;
-    if ((where & SSL_CB_READ_ALERT) == SSL_CB_READ_ALERT) {
-        s->received_alert = kept;
+    if (error == SSL_ERROR_SYSCALL &&
+        (io_errno == ECONNRESET || io_errno == EPIPE)) {
+        kind = MTS_END_PEER_RESET;
     }
-    if ((where & SSL_CB_WRITE_ALERT) == SSL_CB_WRITE_ALERT) {
-        s->sent_alert = kept;
+    if (error == SSL_ERROR_SSL) {
+        unsigned long first = ERR_peek_error();
+        int reason = ERR_GET_LIB(first) == ERR_LIB_SSL ? ERR_GET_REASON(first)
+                                                       : 0;
+        if (reason == SSL_R_UNEXPECTED_EOF_WHILE_READING) {
+            kind = MTS_END_PEER_CLOSED;
+        } else if (reason >= SSL_AD_REASON_OFFSET) {
+            kind = MTS_END_PEER_ALERT;
+            alert = reason - SSL_AD_REASON_OFFSET;
+        } else if (s->alert_written >= 0) {
+            kind = MTS_END_LOCAL_ALERT;
+            alert = s->alert_written;
+        } else {
+            kind = MTS_END_LOCAL_FAILURE;
+        }
     }
+    s->end_kind = kind;
+    s->end_alert = alert;
+}
+
+/* Decides the end and returns the negated class, with -MTS_PEER_CLOSED for
+ * a TCP end without close_notify, which lies outside SSL_get_error's
+ * classes. */
+static int mts_failure(mts_ssl *s, int error, int io_errno) {
+    mts_end_decide(s, error, io_errno);
+    if (error != SSL_ERROR_SSL) return -error;
+    if (s->end_kind != MTS_END_PEER_CLOSED) return -error;
+    return -MTS_PEER_CLOSED;
 }
 
 static int mts_ticket_seen(SSL *ssl, SSL_SESSION *session) {
@@ -807,8 +841,8 @@ void *mts_ssl_new(void *p, int fd) {
     s->config = c;
     s->hello = MTS_HELLO_FIRST;
     s->requested_name[0] = 0;
-    s->received_alert = -1;
-    s->sent_alert = -1;
+    s->end_alert = -1;
+    s->alert_written = -1;
     SSL_set_app_data(s->ssl, s);
     SSL_set_info_callback(s->ssl, mts_alert_seen);
     atomic_fetch_add_explicit(&c->refs, 1, memory_order_relaxed);
@@ -855,20 +889,6 @@ int mts_ssl_set_connect_name(void *s, const char *sni) {
     return 0;
 }
 
-/* An end of the TCP stream with no close_notify is the peer closing. libssl
- * answers it with a decode_error alert written to the closed peer; that
- * alert judges nothing, so it is not kept as sent. */
-static int mts_end_failure(mts_ssl *s, int error) {
-    if (error != SSL_ERROR_SSL) return -error;
-    unsigned long reason = ERR_peek_error();
-    if (ERR_GET_LIB(reason) != ERR_LIB_SSL) return -error;
-    if (ERR_GET_REASON(reason) != SSL_R_UNEXPECTED_EOF_WHILE_READING) {
-        return -error;
-    }
-    s->sent_alert = -1;
-    return -MTS_PEER_CLOSED;
-}
-
 /* SSL_get_error requires the thread error queue to be empty before the I/O
  * call it classifies. Handshake calls return 0 on completion or the negated
  * error class. WANT_READ (-2) and WANT_WRITE (-3) are progress states. */
@@ -880,7 +900,8 @@ int mts_ssl_connect(void *s) {
     errno = 0;
     int n = SSL_connect(ssl);
     int io_errno = errno;
-    int result = n == 1 ? 0 : mts_end_failure(s, SSL_get_error(ssl, n));
+    int result =
+        n == 1 ? 0 : mts_failure(s, SSL_get_error(ssl, n), io_errno);
     mts_sigpipe_guard_end(&guard, io_errno);
     return result;
 }
@@ -940,7 +961,7 @@ static int mts_confirm_after_wait(mts_ssl *s) {
             result = 0;
             break;
         }
-        result = -error;
+        result = mts_failure(s, error, io_errno);
         break;
     }
     (void)fcntl(fd, F_SETFL, flags);
@@ -956,17 +977,16 @@ static int mts_confirm_after_wait(mts_ssl *s) {
  * SO_RCVTIMEO and must have one; a non-blocking one reports WANT_READ until
  * the verdict, and its caller bounds the wait. */
 static int mts_verdict_failure(mts_ssl *s, int error, int io_errno) {
-    if (s->received_alert >= 0) return -MTS_REJECTED;
-    if (error == SSL_ERROR_ZERO_RETURN) return -MTS_PEER_CLOSED;
-    if (error == SSL_ERROR_SYSCALL) {
-        if (io_errno == 0 || io_errno == ECONNRESET || io_errno == EPIPE) {
-            return -MTS_PEER_CLOSED;
-        }
-        return -SSL_ERROR_SYSCALL;
-    }
     /* SSL_peek on a completed client handshake reports no other class. */
-    if (error != SSL_ERROR_SSL) abort();
-    if (mts_end_failure(s, error) == -MTS_PEER_CLOSED) return -MTS_PEER_CLOSED;
+    if (error != SSL_ERROR_SSL && error != SSL_ERROR_SYSCALL &&
+        error != SSL_ERROR_ZERO_RETURN) {
+        abort();
+    }
+    mts_end_decide(s, error, io_errno);
+    if (s->end_kind == MTS_END_PEER_ALERT) return -MTS_REJECTED;
+    if (s->end_kind == MTS_END_PEER_CLOSED) return -MTS_PEER_CLOSED;
+    if (s->end_kind == MTS_END_PEER_RESET) return -MTS_PEER_CLOSED;
+    if (error == SSL_ERROR_SYSCALL) return -SSL_ERROR_SYSCALL;
     return -MTS_PROTOCOL;
 }
 
@@ -1073,15 +1093,16 @@ int mts_ssl_accept(void *s) {
     errno = 0;
     int n = SSL_accept(ssl);
     int io_errno = errno;
-    int result = n == 1 ? 0 : mts_end_failure(s, SSL_get_error(ssl, n));
+    int result =
+        n == 1 ? 0 : mts_failure(s, SSL_get_error(ssl, n), io_errno);
     mts_sigpipe_guard_end(&guard, io_errno);
     return result;
 }
 
-static int mts_read_failure(mts_ssl *s, int n) {
+static int mts_read_failure(mts_ssl *s, int n, int io_errno) {
     int error = SSL_get_error(s->ssl, n);
-    if (error == SSL_ERROR_ZERO_RETURN) return 0;
-    return mts_end_failure(s, error);
+    int result = mts_failure(s, error, io_errno);
+    return error == SSL_ERROR_ZERO_RETURN ? 0 : result;
 }
 
 /* Returns bytes read (> 0), 0 on clean TLS EOF (close_notify),
@@ -1095,7 +1116,7 @@ int mts_ssl_read(void *s, unsigned char *buf, int len) {
     errno = 0;
     int n = SSL_read(ssl, buf, len);
     int io_errno = errno;
-    int result = n > 0 ? n : mts_read_failure((mts_ssl *)s, n);
+    int result = n > 0 ? n : mts_read_failure((mts_ssl *)s, n, io_errno);
     mts_sigpipe_guard_end(&guard, io_errno);
     return result;
 }
@@ -1109,19 +1130,19 @@ int mts_ssl_write(void *s, const unsigned char *buf, int len) {
     errno = 0;
     int n = SSL_write(ssl, buf, len);
     int io_errno = errno;
-    int result = n > 0 ? n : -SSL_get_error(ssl, n);
+    int result =
+        n > 0 ? n : mts_failure((mts_ssl *)s, SSL_get_error(ssl, n), io_errno);
     mts_sigpipe_guard_end(&guard, io_errno);
     return result;
 }
 
-/* The description of the last fatal alert received, or -1 for none. */
-int mts_ssl_received_alert(void *s) {
-    return ((mts_ssl *)s)->received_alert;
+/* What ended the session (MTS_END_*), and its alert description or -1. */
+int mts_ssl_end_kind(void *s) {
+    return ((mts_ssl *)s)->end_kind;
 }
 
-/* The description of the last refusing alert this side sent, or -1. */
-int mts_ssl_sent_alert(void *s) {
-    return ((mts_ssl *)s)->sent_alert;
+int mts_ssl_end_alert(void *s) {
+    return ((mts_ssl *)s)->end_alert;
 }
 
 int mts_ssl_wants_read(void *s) {
@@ -1299,9 +1320,6 @@ int mts_ssl_session_reused(void *s) {
     return SSL_session_reused(((mts_ssl *)s)->ssl) ? 1 : 0;
 }
 
-long mts_ssl_verify_result(void *s) {
-    return SSL_get_verify_result(((mts_ssl *)s)->ssl);
-}
 
 /* Returns the DER length of the peer's leaf certificate, 0 when the peer did
  * not present one, or a negative value on encoding or size failure. The X509

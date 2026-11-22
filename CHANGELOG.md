@@ -2,15 +2,16 @@
 
 ## Unreleased
 
+- `end_cause()` on `TLSHandshake` and `TLSStream` returns a `TLSEnd`, the
+  one thing that ended the session: `peer_closed`, `peer_reset`,
+  `peer_alert` or `local_alert` with the alert description, or
+  `local_failure`. The session decides it once, when the step, read or
+  write that met the end returns, and the first end stands; a peer's TCP
+  end stays `peer_closed` although libssl then writes decode_error to the
+  closed peer. It replaces `received_alert()` and `TLSAlert`, and the
+  unreleased `sent_alert()` and `verify_error()`.
 - A handshake step that meets the peer's end of the connection raises
-  `CONNECTION_RESET_ERROR`, as a read does; it raised a generic handshake
-  failure. The decode_error alert libssl writes to the closed peer on any
-  such end is not recorded by `sent_alert()`, so a peer that went away
-  never reads as this side's refusal.
-- `sent_alert()` on `TLSHandshake` and `TLSStream` returns the last alert
-  this side sent that refused the session, under the same rules as
-  `received_alert()`, so a server tells its own refusal of a client (for
-  example certificate_required) from a peer that went away.
+  `CONNECTION_RESET_ERROR`, as a read does.
 - `TLSContext.client(server_tickets_after_verify=True)` makes a TLS 1.3
   client that sent a certificate complete its handshake only on the
   server's verdict, the first post-handshake record. A session ticket
@@ -24,14 +25,6 @@
   50 ms wait for a post-handshake alert.
 - A server context that requires client certificates aborts at start if
   it would send no TLS 1.3 tickets, since such clients wait for them.
-- `received_alert()` records only alerts the peer sent. A fatal alert this
-  side sent was recorded too, so a local failure could read as the peer's
-  rejection. close_notify and user_canceled are never recorded, and a TLS
-  1.3 alert is recorded at either level, since TLS 1.3 ignores the level.
-- `TLSHandshake.verify_error()` returns the X509 error code when this
-  side refused the peer's certificate, so a caller tells its own
-  rejection from a peer's alert or a closed connection.
-
 - A read that meets the end of the connection with no close_notify
   raises mojo-net's typed `CONNECTION_RESET_ERROR`, as a TCP reset does;
   check it with `is_connection_reset()`. It was the untyped "tls read
