@@ -1314,3 +1314,85 @@ int mts_ed25519_sign(const char *path, const unsigned char *message,
     EVP_PKEY_free(key);
     return ok ? 0 : -1;
 }
+
+/* AES-256-GCM with a 12-byte nonce and a 16-byte tag, the AEAD the content
+ * plane seals objects with (python/cp/keyd/envelope.py uses the same), and
+ * AES-256-CTR at a byte offset, which encrypts local cache files in place
+ * under a key that never leaves the process. */
+
+#define MTS_AES_KEY_BYTES 32
+#define MTS_GCM_NONCE_BYTES 12
+#define MTS_GCM_TAG_BYTES 16
+#define MTS_CTR_BLOCK_BYTES 16
+
+/* Writes `len` ciphertext bytes and then the tag to `out`. */
+int mts_aes256gcm_seal(const unsigned char *key, const unsigned char *nonce,
+                       const unsigned char *aad, int aad_len,
+                       const unsigned char *in, int len, unsigned char *out) {
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    int n = 0;
+    int ok = ctx && aad_len >= 0 && len >= 0 &&
+             EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) == 1 &&
+             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, MTS_GCM_NONCE_BYTES,
+                                 NULL) == 1 &&
+             EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) == 1 &&
+             (aad_len == 0 ||
+              EVP_EncryptUpdate(ctx, NULL, &n, aad, aad_len) == 1) &&
+             (len == 0 || EVP_EncryptUpdate(ctx, out, &n, in, len) == 1) &&
+             EVP_EncryptFinal_ex(ctx, out + len, &n) == 1 &&
+             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, MTS_GCM_TAG_BYTES,
+                                 out + len) == 1;
+    EVP_CIPHER_CTX_free(ctx);
+    return ok ? 0 : -1;
+}
+
+/* Opens `len` bytes of ciphertext followed by its tag into `out`; -1 when
+ * the tag does not authenticate. */
+int mts_aes256gcm_open(const unsigned char *key, const unsigned char *nonce,
+                       const unsigned char *aad, int aad_len,
+                       const unsigned char *in, int len, unsigned char *out) {
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    int n = 0;
+    unsigned char tag[MTS_GCM_TAG_BYTES];
+    if (len >= 0) memcpy(tag, in + len, MTS_GCM_TAG_BYTES);
+    int ok = ctx && aad_len >= 0 && len >= 0 &&
+             EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) == 1 &&
+             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, MTS_GCM_NONCE_BYTES,
+                                 NULL) == 1 &&
+             EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) == 1 &&
+             (aad_len == 0 ||
+              EVP_DecryptUpdate(ctx, NULL, &n, aad, aad_len) == 1) &&
+             (len == 0 || EVP_DecryptUpdate(ctx, out, &n, in, len) == 1) &&
+             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, MTS_GCM_TAG_BYTES,
+                                 tag) == 1 &&
+             EVP_DecryptFinal_ex(ctx, out + len, &n) == 1;
+    EVP_CIPHER_CTX_free(ctx);
+    if (!ok && len > 0) OPENSSL_cleanse(out, (size_t)len);
+    return ok ? 0 : -1;
+}
+
+/* XORs `len` bytes of `in` with the AES-256-CTR keystream that starts at
+ * byte `offset` of a stream whose first counter block is all zero. */
+int mts_aes256ctr_xor(const unsigned char *key, unsigned long long offset,
+                      const unsigned char *in, int len, unsigned char *out) {
+    unsigned char counter[MTS_CTR_BLOCK_BYTES] = {0};
+    unsigned long long block = offset / MTS_CTR_BLOCK_BYTES;
+    for (int i = 0; i < 8; i++)
+        counter[MTS_CTR_BLOCK_BYTES - 1 - i] = (unsigned char)(block >> (8 * i));
+    unsigned char skip[MTS_CTR_BLOCK_BYTES] = {0};
+    int skipped = (int)(offset % MTS_CTR_BLOCK_BYTES);
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    int n = 0;
+    int ok = ctx && len >= 0 &&
+             EVP_EncryptInit_ex(ctx, EVP_aes_256_ctr(), NULL, key, counter) == 1 &&
+             (skipped == 0 ||
+              EVP_EncryptUpdate(ctx, skip, &n, skip, skipped) == 1) &&
+             (len == 0 || EVP_EncryptUpdate(ctx, out, &n, in, len) == 1);
+    EVP_CIPHER_CTX_free(ctx);
+    return ok ? 0 : -1;
+}
+
+/* Fills `out` with `len` bytes from the OpenSSL CSPRNG. */
+int mts_random_bytes(unsigned char *out, int len) {
+    return len >= 0 && RAND_bytes(out, len) == 1 ? 0 : -1;
+}
