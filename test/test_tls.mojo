@@ -581,6 +581,35 @@ def test_an_alert_is_sent_by_one_side_and_received_by_the_other() raises:
     assert_false(Bool(server.sent_alert()), "a received alert is not sent")
 
 
+def test_a_user_canceled_alert_is_not_recorded() raises:
+    # A raw TCP peer reads the ClientHello, writes a plaintext fatal-level
+    # user_canceled record, then shuts down its write side; the client
+    # steps only after both, before any ServerHello fixes the version, so
+    # only the description rule keeps the alert from being recorded.
+    var listener = TCPListener("127.0.0.1", 0)
+    var client_tcp = TCPStream.connect("127.0.0.1", listener.local_port)
+    var peer = listener.accept()
+    listener.close()
+    client_tcp.set_nonblocking(True)
+    var client_ctx = TLSContext.client(ca_file=String(CA))
+    var client = client_ctx.start_connect(client_tcp^, "localhost")
+    assert_false(client.advance(), "the client waits for the server")
+    await_readable(peer.descriptor())
+    var hello = List[Byte](length=16384, fill=0)
+    assert_true(peer.read(hello) > 0, "the ClientHello arrives")
+    var alert: List[Byte] = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x5A]
+    peer.write_all(alert)
+    comptime SHUT_WR = 1
+    assert_equal(
+        external_call["shutdown", c_int](peer.descriptor(), c_int(SHUT_WR)),
+        0,
+    )
+    step_until_raises(client)
+    assert_false(Bool(client.received_alert()), "user_canceled is no refusal")
+    assert_false(Bool(client.sent_alert()), "the client refused nothing")
+    peer.close()
+
+
 def test_reject_untrusted_client_certificate() raises:
     var server = fork_tls_echo_server(
         SERVER_CERT,
@@ -1409,6 +1438,7 @@ def main() raises:
     test_alert_in_the_handshake_is_received()
     test_alert_after_the_handshake_is_received_on_read()
     test_an_alert_is_sent_by_one_side_and_received_by_the_other()
+    test_a_user_canceled_alert_is_not_recorded()
     test_reject_untrusted_client_certificate()
     test_certificate_client_completes_on_the_ticket()
     test_certificate_client_reads_the_alert_before_the_reset()
