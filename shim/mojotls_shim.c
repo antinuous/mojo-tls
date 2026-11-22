@@ -27,13 +27,16 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
+#include <openssl/rand.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -45,19 +48,25 @@
 
 typedef struct mts_server_name {
     char *host;
+    uint64_t hash;
     SSL_CTX *ctx;
     struct mts_server_name *next;
 } mts_server_name;
 
 /* The servername callback reads names on handshake threads while add and
- * remove may run on another thread, so names_lock guards the list. */
+ * remove may run on another thread, so names_lock guards the table. names
+ * holds names_buckets chains, zero or a power of two, and names_count never
+ * exceeds names_buckets. */
 typedef struct {
     SSL_CTX *ctx;
     unsigned char alpn_wire[256];
     int alpn_len;
     atomic_int refs;
     pthread_mutex_t names_lock;
-    mts_server_name *names;
+    mts_server_name **names;
+    size_t names_buckets;
+    size_t names_count;
+    uint64_t names_seed;
     int names_installed;
     /* NUL-separated host names that negotiate no ALPN, under names_lock. */
     char *raw_names;
@@ -242,6 +251,12 @@ void *mts_ctx_new_server(const char *cert_chain_pem, const char *key_pem) {
         free(c);
         return NULL;
     }
+    if (RAND_bytes((unsigned char *)&c->names_seed, sizeof(c->names_seed)) !=
+        1) {
+        SSL_CTX_free(c->ctx);
+        free(c);
+        return NULL;
+    }
     atomic_init(&c->refs, 1);
     pthread_mutex_init(&c->names_lock, NULL);
     SSL_CTX_set_min_proto_version(c->ctx, TLS1_2_VERSION);
@@ -357,16 +372,69 @@ static void mts_ctx_release(mts_ctx *c) {
     if (!c) return;
     if (atomic_fetch_sub_explicit(&c->refs, 1, memory_order_acq_rel) != 1)
         return;
-    while (c->names) {
-        mts_server_name *next = c->names->next;
-        mts_server_name_free(c->names);
-        c->names = next;
+    for (size_t i = 0; i < c->names_buckets; i++) {
+        while (c->names[i]) {
+            mts_server_name *next = c->names[i]->next;
+            mts_server_name_free(c->names[i]);
+            c->names[i] = next;
+        }
     }
+    free(c->names);
     free(c->raw_names);
     free(c->h2_names);
     pthread_mutex_destroy(&c->names_lock);
     SSL_CTX_free(c->ctx);
     free(c);
+}
+
+/* FNV-1a of the ASCII-lowercased name, started from the context's random
+ * seed so the bucket a registered name lands in is not known in advance. */
+static uint64_t mts_name_hash(const mts_ctx *c, const char *host) {
+    uint64_t hash = c->names_seed ^ 0xcbf29ce484222325ULL;
+    for (const unsigned char *p = (const unsigned char *)host; *p; p++) {
+        unsigned char byte = *p >= 'A' && *p <= 'Z' ? *p + ('a' - 'A') : *p;
+        hash = (hash ^ byte) * 0x100000001b3ULL;
+    }
+    return hash;
+}
+
+/* The link holding host's entry, or the empty link ending its chain. Called
+ * with names_lock held and at least one bucket. */
+static mts_server_name **mts_name_link(mts_ctx *c, const char *host,
+                                       uint64_t hash) {
+    assert(c->names_buckets > 0);
+    mts_server_name **link = &c->names[hash & (c->names_buckets - 1)];
+    while (*link) {
+        if ((*link)->hash == hash && strcasecmp((*link)->host, host) == 0)
+            break;
+        link = &(*link)->next;
+    }
+    return link;
+}
+
+static mts_server_name *mts_name_find(mts_ctx *c, const char *host) {
+    if (c->names_buckets == 0) return NULL;
+    return *mts_name_link(c, host, mts_name_hash(c, host));
+}
+
+/* An exact name wins. Otherwise a name registered as "*.<rest>" covers a
+ * host whose leftmost label is not empty and whose remaining labels are
+ * <rest>: exactly one label, as RFC 6125 section 6.4.3 reads a wildcard.
+ * Called with names_lock held. */
+static mts_server_name *mts_name_match(mts_ctx *c, const char *host) {
+    mts_server_name *exact = mts_name_find(c, host);
+    if (exact) return exact;
+    const char *rest = strchr(host, '.');
+    if (!rest) return NULL;
+    if (rest == host) return NULL;
+    char wildcard[TLSEXT_MAXLEN_host_name + 1];
+    size_t rest_len = strlen(rest);
+    /* OpenSSL refuses a host_name longer than TLSEXT_MAXLEN_host_name, and
+     * rest is shorter than host by at least the one-byte label. */
+    assert(rest_len < sizeof(wildcard) - 1);
+    wildcard[0] = '*';
+    memcpy(wildcard + 1, rest, rest_len + 1);
+    return mts_name_find(c, wildcard);
 }
 
 /* SSL_set_SSL_CTX takes its own reference on the child, so a handshake keeps
@@ -378,16 +446,33 @@ static int mts_servername_select(SSL *ssl, int *alert, void *arg) {
     mts_ctx *c = (mts_ctx *)arg;
     const char *host = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
     if (!host || !host[0]) return SSL_TLSEXT_ERR_NOACK;
-    int matched = 0;
     pthread_mutex_lock(&c->names_lock);
-    for (mts_server_name *n = c->names; n; n = n->next) {
-        if (strcasecmp(n->host, host) == 0) {
-            matched = SSL_set_SSL_CTX(ssl, n->ctx) != NULL;
-            break;
-        }
-    }
+    mts_server_name *n = mts_name_match(c, host);
+    int matched = n && SSL_set_SSL_CTX(ssl, n->ctx) != NULL;
     pthread_mutex_unlock(&c->names_lock);
     return matched ? SSL_TLSEXT_ERR_OK : SSL_TLSEXT_ERR_NOACK;
+}
+
+/* Doubles the buckets once the entries fill them, so a chain stays about one
+ * entry long. Returns 0 or -1. Called with names_lock held. */
+static int mts_names_reserve(mts_ctx *c) {
+    if (c->names_count < c->names_buckets) return 0;
+    size_t buckets = c->names_buckets ? c->names_buckets * 2 : 1;
+    mts_server_name **table = calloc(buckets, sizeof(*table));
+    if (!table) return -1;
+    for (size_t i = 0; i < c->names_buckets; i++) {
+        while (c->names[i]) {
+            mts_server_name *n = c->names[i];
+            c->names[i] = n->next;
+            mts_server_name **head = &table[n->hash & (buckets - 1)];
+            n->next = *head;
+            *head = n;
+        }
+    }
+    free(c->names);
+    c->names = table;
+    c->names_buckets = buckets;
+    return 0;
 }
 
 static int mts_ctx_use_pem_identity(SSL_CTX *ctx, const unsigned char *chain,
@@ -470,8 +555,9 @@ static SSL_CTX *mts_server_name_ctx(mts_ctx *c, const unsigned char *chain,
     return child;
 }
 
-/* Adds or replaces the certificate served when the client's SNI matches host
- * (ASCII case-insensitive, exact). Returns 0 or -1 with the error queued. */
+/* Adds or replaces the certificate served when the client's SNI matches host,
+ * ASCII case-insensitive. A host "*.<rest>" also covers one label in front of
+ * <rest>, after any exact name. Returns 0 or -1 with the error queued. */
 int mts_ctx_add_server_name(void *server_ctx, const char *host,
                             const unsigned char *chain_pem, int chain_len,
                             const unsigned char *key_pem, int key_len) {
@@ -487,13 +573,19 @@ int mts_ctx_add_server_name(void *server_ctx, const char *host,
     if (!child) return -1;
 
     pthread_mutex_lock(&c->names_lock);
-    mts_server_name *n = c->names;
-    while (n && strcasecmp(n->host, host) != 0) n = n->next;
-    if (n) {
-        SSL_CTX_free(n->ctx);
-        n->ctx = child;
+    if (mts_names_reserve(c) != 0) {
+        pthread_mutex_unlock(&c->names_lock);
+        SSL_CTX_free(child);
+        ERR_raise(ERR_LIB_SSL, ERR_R_MALLOC_FAILURE);
+        return -1;
+    }
+    uint64_t hash = mts_name_hash(c, host);
+    mts_server_name **link = mts_name_link(c, host, hash);
+    if (*link) {
+        SSL_CTX_free((*link)->ctx);
+        (*link)->ctx = child;
     } else {
-        n = calloc(1, sizeof(mts_server_name));
+        mts_server_name *n = calloc(1, sizeof(mts_server_name));
         char *copy = strdup(host);
         if (!n || !copy) {
             pthread_mutex_unlock(&c->names_lock);
@@ -504,9 +596,10 @@ int mts_ctx_add_server_name(void *server_ctx, const char *host,
             return -1;
         }
         n->host = copy;
+        n->hash = hash;
         n->ctx = child;
-        n->next = c->names;
-        c->names = n;
+        *link = n;
+        c->names_count++;
     }
     if (!c->names_installed) {
         SSL_CTX_set_tlsext_servername_callback(c->ctx, mts_servername_select);
@@ -564,11 +657,12 @@ int mts_ctx_remove_server_name(void *server_ctx, const char *host) {
     }
     mts_server_name *removed = NULL;
     pthread_mutex_lock(&c->names_lock);
-    for (mts_server_name **link = &c->names; *link; link = &(*link)->next) {
-        if (strcasecmp((*link)->host, host) == 0) {
-            removed = *link;
+    if (c->names_buckets > 0) {
+        mts_server_name **link = mts_name_link(c, host, mts_name_hash(c, host));
+        removed = *link;
+        if (removed) {
             *link = removed->next;
-            break;
+            c->names_count--;
         }
     }
     pthread_mutex_unlock(&c->names_lock);

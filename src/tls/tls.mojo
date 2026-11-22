@@ -369,11 +369,14 @@ struct TLSContext(Movable):
     ) raises:
         """Serves a certificate to clients whose SNI matches `host`.
 
-        Matching is exact and ASCII case-insensitive. Adding a host again
-        replaces its certificate for new handshakes. Clients without SNI or
-        with an unknown name receive the context's default certificate. The
-        name shares this context's ALPN, protocol floor, and client
-        certificate settings.
+        Matching is ASCII case-insensitive. A `host` of the form
+        `*.example.com` also serves a client whose SNI is exactly one label
+        under `example.com`, such as `a.example.com` but not
+        `b.a.example.com` (RFC 6125 section 6.4.3); a name added exactly wins
+        over it. Adding a host again replaces its certificate for new
+        handshakes. Clients without SNI or with an unknown name receive the
+        context's default certificate. The name shares this context's ALPN,
+        protocol floor, and client certificate settings.
 
         Args:
             host: The DNS name to match against the client's SNI.
