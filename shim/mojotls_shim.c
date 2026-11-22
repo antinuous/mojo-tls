@@ -1432,3 +1432,34 @@ int mts_aes256ctr_xor(const unsigned char *key, unsigned long long offset,
 int mts_random_bytes(unsigned char *out, int len) {
     return len >= 0 && RAND_bytes(out, len) == 1 ? 0 : -1;
 }
+
+/* SHA-256 through an EVP_MD the caller fetches once with mts_sha256_md, so
+ * no hash pays for a method lookup. */
+
+const EVP_MD *mts_sha256_md(void) {
+    return EVP_MD_fetch(NULL, "SHA2-256", NULL);
+}
+
+/* A context ready for updates, or NULL. */
+EVP_MD_CTX *mts_sha256_new(const EVP_MD *md) {
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (ctx && EVP_DigestInit_ex2(ctx, md, NULL) == 1) return ctx;
+    EVP_MD_CTX_free(ctx);
+    return NULL;
+}
+
+int mts_sha256_update(EVP_MD_CTX *ctx, const unsigned char *in, size_t len) {
+    return EVP_DigestUpdate(ctx, in, len) == 1 ? 0 : -1;
+}
+
+/* Writes the 32-byte digest to `out`; the context is then spent. */
+int mts_sha256_final(EVP_MD_CTX *ctx, unsigned char *out) {
+    return EVP_DigestFinal_ex(ctx, out, NULL) == 1 ? 0 : -1;
+}
+
+void mts_sha256_free(EVP_MD_CTX *ctx) { EVP_MD_CTX_free(ctx); }
+
+int mts_sha256(const EVP_MD *md, const unsigned char *in, size_t len,
+               unsigned char *out) {
+    return EVP_Digest(in, len, out, NULL, md, NULL) == 1 ? 0 : -1;
+}
