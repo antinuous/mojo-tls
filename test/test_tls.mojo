@@ -389,9 +389,10 @@ def test_certificate_client_completes_on_the_ticket() raises:
     peer.close()
 
 
-def test_certificate_client_meets_the_rejection_in_the_handshake() raises:
-    # The server is dropped after its alert with the client's flight
-    # unread, so a reset follows the alert.
+def test_certificate_client_reads_the_alert_before_the_reset() raises:
+    # The server is held open until the client's read of its alert has
+    # returned, and only then dropped with the client's flight unread, so
+    # the reset comes after the alert was read.
     var listener = TCPListener("127.0.0.1", 0)
     var client_tcp = TCPStream.connect("127.0.0.1", listener.local_port)
     var server_tcp = listener.accept()
@@ -406,40 +407,20 @@ def test_certificate_client_meets_the_rejection_in_the_handshake() raises:
     var server = server_ctx.start_accept(server_tcp^)
     step_to_the_judgement(client, server)
     step_until_raises(server)
+    var error = step_until_error(client)
+    assert_equal(error, REJECTED_ERROR)
+    var alert = client.received_alert()
+    assert_true(Bool(alert), "the rejection is a received alert")
+    assert_equal(alert.value(), TLSAlert.unknown_ca)
     assert_true(Bool(server.verify_error()), "the server refused the chain")
-    var error = step_until_error(client)
-    assert_equal(error, REJECTED_ERROR)
     assert_false(Bool(client.verify_error()), "the client refused nothing")
-    var alert = client.received_alert()
-    assert_true(Bool(alert), "the rejection is a received alert")
-    assert_equal(alert.value(), TLSAlert.unknown_ca)
+    _ = server^
 
 
-def test_certificate_client_meets_the_alert_with_the_server_open() raises:
-    # The server stays open after its alert, so no reset follows it.
-    var listener = TCPListener("127.0.0.1", 0)
-    var client_tcp = TCPStream.connect("127.0.0.1", listener.local_port)
-    var server_tcp = listener.accept()
-    listener.close()
-    client_tcp.set_nonblocking(True)
-    server_tcp.set_nonblocking(True)
-    var server_ctx = judging_server_context()
-    var client_ctx = certificate_client_context(
-        UNTRUSTED_CLIENT_CERT, UNTRUSTED_CLIENT_KEY
-    )
-    var client = client_ctx.start_connect(client_tcp^, "localhost")
-    var server = server_ctx.start_accept(server_tcp^)
-    step_to_the_judgement(client, server)
-    step_until_raises(server)
-    var error = step_until_error(client)
-    assert_equal(error, REJECTED_ERROR)
-    var alert = client.received_alert()
-    assert_true(Bool(alert), "the rejection is a received alert")
-    assert_equal(alert.value(), TLSAlert.unknown_ca)
-    assert_false(server.is_complete(), "the server stayed open")
-
-
-def test_certificate_client_fails_when_the_server_closes_unjudged() raises:
+def test_certificate_client_meets_a_reset_with_nothing_readable() raises:
+    # The server is dropped before it reads the client's flight, so it
+    # sends no alert and its close over unread data is a reset; the client
+    # has nothing to read when it steps.
     var listener = TCPListener("127.0.0.1", 0)
     var client_tcp = TCPStream.connect("127.0.0.1", listener.local_port)
     var server_tcp = listener.accept()
@@ -523,7 +504,10 @@ def test_certificate_client_fails_when_the_server_ends_with_a_fin() raises:
 
 def fork_stalled_server() raises -> Tuple[UInt16, c_int]:
     # The child answers the ClientHello and then never reads the client's
-    # certificate, so no verdict ever comes.
+    # certificate, so no verdict ever comes. One advance suffices because
+    # libssl writes the whole ClientHello (under 2 KiB, even with a hybrid
+    # post-quantum key share) in one write call, well under the loopback
+    # MTU (16 KiB on macOS, 64 KiB on Linux), so it arrives as one segment.
     var listener = TCPListener("127.0.0.1", 0)
     var port = listener.local_port
     var pid = external_call["fork", c_int]()
@@ -1417,9 +1401,8 @@ def main() raises:
     test_an_alert_this_side_sends_is_not_received()
     test_reject_untrusted_client_certificate()
     test_certificate_client_completes_on_the_ticket()
-    test_certificate_client_meets_the_rejection_in_the_handshake()
-    test_certificate_client_meets_the_alert_with_the_server_open()
-    test_certificate_client_fails_when_the_server_closes_unjudged()
+    test_certificate_client_reads_the_alert_before_the_reset()
+    test_certificate_client_meets_a_reset_with_nothing_readable()
     test_certificate_client_takes_the_ticket_and_close_in_one_read()
     test_certificate_client_fails_when_the_server_ends_with_a_fin()
     test_certificate_client_times_out_without_a_verdict()
