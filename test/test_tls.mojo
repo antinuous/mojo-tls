@@ -202,9 +202,9 @@ def test_required_client_certificate() raises:
 
 
 def test_missing_client_certificate_is_a_received_alert() raises:
-    # TLS 1.3: the client's handshake completes before the server checks
-    # for a client certificate, so the server's certificate_required alert
-    # reaches the client's first read.
+    # TLS 1.3: the server checks for a client certificate after the client's
+    # handshake completes. Its certificate_required alert reaches the client
+    # in the handshake's confirm step or on the first read, by timing.
     var server = fork_tls_echo_server(
         SERVER_CERT,
         SERVER_KEY,
@@ -214,7 +214,19 @@ def test_missing_client_certificate_is_a_received_alert() raises:
     )
     var ctx = TLSContext.client(ca_file=String(CA), alpn=["h2"])
     var tcp = TCPStream.connect("127.0.0.1", server[0])
-    var stream = ctx.connect(tcp^, "localhost")
+    var handshake = ctx.start_connect(tcp^, "localhost")
+    var connected = False
+    try:
+        connected = handshake.advance()
+    except:
+        pass
+    if not connected:
+        var alert = handshake.received_alert()
+        assert_true(Bool(alert), "a failed handshake carries the alert")
+        assert_equal(alert.value(), TLSAlert.certificate_required)
+        reap(server[1])
+        return
+    var stream = handshake^.finish()
     var raised = False
     try:
         stream.write_all("auth".as_bytes())
@@ -244,13 +256,17 @@ def test_reject_untrusted_client_certificate() raises:
         alpn=["h2"],
     )
     var tcp = TCPStream.connect("127.0.0.1", server[0])
+    var handshake = ctx.start_connect(tcp^, "localhost")
     var raised = False
     try:
-        _ = ctx.connect(tcp^, "localhost")
+        _ = handshake.advance()
     except e:
         raised = True
         assert_true("handshake" in String(e), String(e))
     assert_true(raised, "untrusted client certificate must fail connect")
+    var alert = handshake.received_alert()
+    assert_true(Bool(alert), "the rejection is a received alert")
+    assert_equal(alert.value(), TLSAlert.unknown_ca)
     reap(server[1])
 
 
