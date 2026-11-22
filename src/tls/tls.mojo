@@ -272,7 +272,7 @@ struct TLSContext(Movable):
             if ca_file.byte_length() != 0:
                 var path = String(ca_file)
                 var rc = out._lib.get_function[c_int]("mts_ctx_load_ca")(
-                    out._ctx, path.as_c_string_slice()
+                    out._ctx, path.as_c_string_span()
                 )
                 if Int(rc) != 0:
                     raise _shim_error(out._lib, "tls: loading CA bundle")
@@ -290,8 +290,8 @@ struct TLSContext(Movable):
             var key = String(key_pem)
             var rc = out._lib.get_function[c_int]("mts_ctx_load_identity")(
                 out._ctx,
-                cert.as_c_string_slice(),
-                key.as_c_string_slice(),
+                cert.as_c_string_span(),
+                key.as_c_string_span(),
             )
             if Int(rc) != 0:
                 raise _shim_error(
@@ -336,7 +336,7 @@ struct TLSContext(Movable):
         var cert = String(cert_chain_pem)
         var key = String(key_pem)
         var ctx = lib.get_function[UInt64]("mts_ctx_new_server")(
-            cert.as_c_string_slice(), key.as_c_string_slice()
+            cert.as_c_string_span(), key.as_c_string_span()
         )
         if ctx == 0:
             raise _shim_error(lib, "tls: loading certificate/key")
@@ -345,7 +345,7 @@ struct TLSContext(Movable):
             var client_ca = String(client_ca_file)
             var rc = out._lib.get_function[c_int](
                 "mts_ctx_require_client_cert"
-            )(out._ctx, client_ca.as_c_string_slice())
+            )(out._ctx, client_ca.as_c_string_span())
             if Int(rc) != 0:
                 raise _shim_error(out._lib, "tls: loading client CA")
         out._set_alpn(alpn)
@@ -392,7 +392,7 @@ struct TLSContext(Movable):
         var name = String(host)
         var rc = self._lib.get_function[c_int]("mts_ctx_add_server_name")(
             self._ctx,
-            name.as_c_string_slice(),
+            name.as_c_string_span(),
             chain_pem.unsafe_ptr(),
             c_int(len(chain_pem)),
             key_pem.unsafe_ptr(),
@@ -417,7 +417,7 @@ struct TLSContext(Movable):
             raise Error("tls: server names require a server context")
         var name = String(host)
         var rc = self._lib.get_function[c_int]("mts_ctx_remove_server_name")(
-            self._ctx, name.as_c_string_slice()
+            self._ctx, name.as_c_string_span()
         )
         if Int(rc) < 0:
             raise _shim_error(self._lib, "tls: removing server name")
@@ -571,14 +571,14 @@ struct TLSContext(Movable):
                 ssl,
                 ticket.unsafe_ptr(),
                 c_int(len(ticket)),
-                host.as_c_string_slice(),
+                host.as_c_string_span(),
             )
             if Int(session_rc) != 0:
                 var err = _shim_error(lib, "tls: session resume")
                 lib.get_function[NoneType]("mts_ssl_free")(ssl)
                 raise err
         var rc = lib.get_function[c_int]("mts_ssl_set_connect_name")(
-            ssl, host.as_c_string_slice()
+            ssl, host.as_c_string_span()
         )
         if Int(rc) != 0:
             var err = _shim_error(lib, "tls: hostname configuration")
