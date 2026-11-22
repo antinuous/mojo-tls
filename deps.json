@@ -2,7 +2,7 @@
   "dir": ".deps",
   "deps": {
     "mojo-net": {
-      "ref": "v0.2.8"
+      "commit": "47303d0baa5e2155b4b73ee1f8c287ed45dc0ab9"
     }
   }
 }
