@@ -1254,3 +1254,63 @@ int mts_leaf_issue(const char *ca_cert_path, const char *ca_key_path,
     EVP_PKEY_free(key);
     return ok ? 0 : -1;
 }
+
+/* Ed25519 node identity: a key kept as a PKCS#8 PEM file, mode 0600,
+ * created on first use and never replaced, so a node keeps the key its host
+ * enrolled with across restarts. */
+
+#define MTS_ED25519_PUBLIC_BYTES 32
+#define MTS_ED25519_SIGNATURE_BYTES 64
+
+static EVP_PKEY *mts_ed25519_load(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    EVP_PKEY *key = PEM_read_PrivateKey(f, NULL, mts_reject_password, NULL);
+    fclose(f);
+    if (key && EVP_PKEY_get_id(key) != EVP_PKEY_ED25519) {
+        EVP_PKEY_free(key);
+        return NULL;
+    }
+    return key;
+}
+
+static EVP_PKEY *mts_ed25519_create(const char *path) {
+    char staged[4096];
+    if (snprintf(staged, sizeof staged, "%s.staged", path) >= (int)sizeof staged)
+        return NULL;
+    EVP_PKEY *key = EVP_PKEY_Q_keygen(NULL, NULL, "ED25519");
+    if (key && (mts_write_key(staged, key) != 0 || rename(staged, path) != 0)) {
+        EVP_PKEY_free(key);
+        return NULL;
+    }
+    return key;
+}
+
+/* Writes the 32-byte public key of the key at `path`, creating it when the
+ * file does not exist. An unreadable or foreign key file fails. */
+int mts_ed25519_key(const char *path, unsigned char *public_key) {
+    EVP_PKEY *key = access(path, F_OK) == 0 ? mts_ed25519_load(path)
+                                            : mts_ed25519_create(path);
+    size_t len = MTS_ED25519_PUBLIC_BYTES;
+    int ok = key && EVP_PKEY_get_raw_public_key(key, public_key, &len) == 1 &&
+             len == MTS_ED25519_PUBLIC_BYTES;
+    EVP_PKEY_free(key);
+    return ok ? 0 : -1;
+}
+
+/* Writes the 64-byte Ed25519 signature of `message` under the key at
+ * `path`. */
+int mts_ed25519_sign(const char *path, const unsigned char *message,
+                     int message_len, unsigned char *signature) {
+    EVP_PKEY *key = mts_ed25519_load(path);
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    size_t len = MTS_ED25519_SIGNATURE_BYTES;
+    int ok = key && ctx && message_len >= 0 &&
+             EVP_DigestSignInit(ctx, NULL, NULL, NULL, key) == 1 &&
+             EVP_DigestSign(ctx, signature, &len, message,
+                            (size_t)message_len) == 1 &&
+             len == MTS_ED25519_SIGNATURE_BYTES;
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(key);
+    return ok ? 0 : -1;
+}
