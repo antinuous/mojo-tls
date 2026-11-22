@@ -1184,7 +1184,9 @@ struct TLSStream(ReadinessStream):
 
         var san_bytes = List[Byte](length=_MAX_PEER_SAN_BYTES, fill=0)
         var san_length = Int(
-            self._lib.get_function[c_int]("mts_ssl_peer_subject_alt_names")(
+            self._lib.get_function[c_int](
+                "mts_ssl_peer_subject_alt_names"
+            )(
                 self._ssl,
                 san_bytes.unsafe_ptr(),
                 c_int(_MAX_PEER_SAN_BYTES),
@@ -1210,8 +1212,9 @@ struct TLSStream(ReadinessStream):
             if san_length - offset < 3:
                 raise Error("tls: malformed peer certificate name copy")
             var kind = Int(san_bytes[offset])
-            var value_length = Int(san_bytes[offset + 1]) << 8 | Int(
-                san_bytes[offset + 2]
+            var value_length = (
+                Int(san_bytes[offset + 1]) << 8
+                | Int(san_bytes[offset + 2])
             )
             offset += 3
             if (
