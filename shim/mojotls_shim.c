@@ -1348,24 +1348,35 @@ int mts_last_error(char *buf, int cap) {
 #define MTS_CA_NOT_AFTER "40960101000000Z"
 #define MTS_LEAF_DAYS 397
 
+/* The issuers return 0, the errno of a file they could not open, write or
+ * close, or -1 when OpenSSL refused, so a caller tells a full disk from a
+ * failed signature. */
+
+static int mts_closed(FILE *f, int ok) {
+    int failed = ferror(f) ? errno : 0;
+    if (fclose(f) != 0 && failed == 0) failed = errno;
+    if (failed != 0) return failed > 0 ? failed : EIO;
+    return ok == 1 ? 0 : -1;
+}
+
 static int mts_write_key(const char *path, EVP_PKEY *key) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0) return -1;
+    if (fd < 0) return errno;
     FILE *f = fdopen(fd, "w");
     if (!f) {
+        int failed = errno;
         close(fd);
-        return -1;
+        return failed;
     }
-    int ok = PEM_write_PrivateKey(f, key, NULL, NULL, 0, NULL, NULL);
-    return (fclose(f) == 0 && ok == 1) ? 0 : -1;
+    return mts_closed(f, PEM_write_PrivateKey(f, key, NULL, NULL, 0, NULL, NULL));
 }
 
 static int mts_write_certs(const char *path, X509 *first, X509 *second) {
     FILE *f = fopen(path, "w");
-    if (!f) return -1;
+    if (!f) return errno;
     int ok = PEM_write_X509(f, first);
     if (ok == 1 && second) ok = PEM_write_X509(f, second);
-    return (fclose(f) == 0 && ok == 1) ? 0 : -1;
+    return mts_closed(f, ok);
 }
 
 static int mts_add_ext(X509 *cert, X509 *issuer, int nid, const char *value) {
@@ -1419,12 +1430,12 @@ int mts_ca_new(const char *common_name, const char *cert_path,
              mts_add_ext(cert, cert, NID_key_usage,
                          "critical,keyCertSign,cRLSign") == 0 &&
              mts_add_ext(cert, cert, NID_subject_key_identifier, "hash") == 0 &&
-             X509_sign(cert, key, EVP_sha256()) > 0 &&
-             mts_write_key(key_path, key) == 0 &&
-             mts_write_certs(cert_path, cert, NULL) == 0;
+             X509_sign(cert, key, EVP_sha256()) > 0;
+    int rc = ok ? mts_write_key(key_path, key) : -1;
+    if (rc == 0) rc = mts_write_certs(cert_path, cert, NULL);
     X509_free(cert);
     EVP_PKEY_free(key);
-    return ok ? 0 : -1;
+    return rc;
 }
 
 static int mts_is_ip(const char *name) {
@@ -1437,13 +1448,14 @@ int mts_leaf_issue(const char *ca_cert_path, const char *ca_key_path,
                    const char *server_name, const char *cert_path,
                    const char *key_path) {
     FILE *f = fopen(ca_cert_path, "r");
-    if (!f) return -1;
+    if (!f) return errno;
     X509 *ca = PEM_read_X509(f, NULL, NULL, NULL);
     fclose(f);
     f = fopen(ca_key_path, "r");
     if (!f) {
+        int failed = errno;
         X509_free(ca);
-        return -1;
+        return failed;
     }
     EVP_PKEY *ca_key = PEM_read_PrivateKey(f, NULL, mts_reject_password, NULL);
     fclose(f);
@@ -1464,14 +1476,14 @@ int mts_leaf_issue(const char *ca_cert_path, const char *ca_key_path,
          mts_add_ext(cert, ca, NID_ext_key_usage, "serverAuth") == 0 &&
          mts_add_ext(cert, ca, NID_subject_alt_name, san) == 0 &&
          mts_add_ext(cert, ca, NID_authority_key_identifier, "keyid") == 0 &&
-         X509_sign(cert, ca_key, EVP_sha256()) > 0 &&
-         mts_write_key(key_path, key) == 0 &&
-         mts_write_certs(cert_path, cert, ca) == 0;
+         X509_sign(cert, ca_key, EVP_sha256()) > 0;
+    int rc = ok ? mts_write_key(key_path, key) : -1;
+    if (rc == 0) rc = mts_write_certs(cert_path, cert, ca);
     X509_free(cert);
     X509_free(ca);
     EVP_PKEY_free(ca_key);
     EVP_PKEY_free(key);
-    return ok ? 0 : -1;
+    return rc;
 }
 
 /* Ed25519 node identity: a key kept as a PKCS#8 PEM file, mode 0600,
