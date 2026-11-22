@@ -6,7 +6,7 @@
 # IOStream trait (sibling checkout, .deps/, or MOJO_DEPS_DIR).
 
 [workspace]
-channels = ["https://conda.modular.com/max", "conda-forge"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "mojo-tls"
 platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 version = "0.3.5"
@@ -23,7 +23,7 @@ blocking-example = { cmd = "python3 examples/run_blocking_tls_client.py", depend
 package-test = "python3 packaging/test_installed_package.py"
 
 [dependencies]
-mojo = ">=1.0.0,<2"
+mojo = "==1.3.0.dev2026102505"
 python = ">=3.11"
 openssl = ">=3"
 c-compiler = "*"

@@ -9,6 +9,8 @@ hostname verification, ALPN, certificate verification, and TLS 1.3 session
 tickets over [mojo-net](https://github.com/nsalerni/mojo-net)'s `TCPStream`.
 Early data is never sent.
 
+This mirror locks the Mojo build that antinuous/research pins, and a research toolchain bump moves this lock in the same batch.
+
 **[Compliance report](https://nsalerni.github.io/mojo-tls/COMPLIANCE.html)**
 ([Markdown](COMPLIANCE.md)) is regenerated on every CI run.
 
