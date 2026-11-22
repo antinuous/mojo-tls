@@ -860,9 +860,9 @@ struct TLSStream(ReadinessStream):
         context += " failed"
         raise _shim_error(self._lib, context^)
 
-    def _read_some(self, mut buf: List[Byte]) raises -> Int:
+    def _read_some(self, mut buf: List[Byte], start: Int) raises -> Int:
         var n = self._lib.get_function[c_int]("mts_ssl_read")(
-            self._ssl, buf.unsafe_ptr(), c_int(len(buf))
+            self._ssl, buf.unsafe_ptr() + start, c_int(len(buf) - start)
         )
         if Int(n) >= 0:
             return Int(n)
@@ -932,7 +932,7 @@ struct TLSStream(ReadinessStream):
         """
         if len(buf) == 0:
             return 0
-        var n = self._read_some(buf)
+        var n = self._read_some(buf, 0)
         buf.shrink(n)
         return n
 
@@ -949,14 +949,13 @@ struct TLSStream(ReadinessStream):
             On a TLS close before n bytes arrive, on TLS or transport
             errors, or with the typed timeout error.
         """
-        var out = List[Byte](capacity=n)
-        while len(out) < n:
-            var chunk = List[Byte]()
-            chunk.resize(n - len(out), 0)
-            var got = self._read_some(chunk)
+        var out = List[Byte](length=n, fill=0)
+        var filled = 0
+        while filled < n:
+            var got = self._read_some(out, filled)
             if got == 0:
                 raise Error("connection closed mid-read (EOF)")
-            out.extend(Span(chunk)[0:got])
+            filled += got
         return out^
 
     def write_all(self, data: Span[Byte, _]) raises:
