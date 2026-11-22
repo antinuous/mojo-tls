@@ -61,6 +61,9 @@ typedef struct mts_server_name {
  * exceeds names_buckets. */
 typedef struct {
     SSL_CTX *ctx;
+    /* A client whose servers send a post-handshake record only after they
+     * verified its certificate (see mts_ssl_confirm_connect). */
+    int await_verdict;
     unsigned char alpn_wire[256];
     int alpn_len;
     atomic_int refs;
@@ -89,8 +92,9 @@ typedef struct {
     char requested_name[TLSEXT_MAXLEN_host_name + 1];
     /* The description of the last fatal alert the peer sent, or -1. */
     int received_alert;
-    /* A client that wrote its certificate, and one that then received a
-     * session ticket (see mts_ssl_confirm_connect). */
+    /* A client with a certificate configured that answered a certificate
+     * request, and one that then received a session ticket (see
+     * mts_ssl_confirm_connect). */
     int sent_certificate;
     int ticket_seen;
 } mts_ssl;
@@ -111,6 +115,8 @@ typedef struct {
  * reports it as SSL_ERROR_SSL with SSL_R_UNEXPECTED_EOF_WHILE_READING. The
  * value lies outside SSL_get_error's classes. */
 #define MTS_PEER_CLOSED 100
+#define MTS_REJECTED 101
+#define MTS_UNBOUNDED 102
 
 /* OpenSSL's socket BIO uses write(2), so a peer reset can raise SIGPIPE on
  * Linux before libssl returns SSL_ERROR_SYSCALL. Block the signal only on
@@ -315,6 +321,15 @@ int mts_ctx_load_ca(void *p, const char *ca_pem_path) {
                                          NULL) == 1
                ? 0
                : -1;
+}
+
+void mts_ctx_await_verdict(void *p) {
+    ((mts_ctx *)p)->await_verdict = 1;
+}
+
+/* TLS 1.3 tickets a server sends after a full handshake. */
+long mts_ctx_ticket_count(void *p) {
+    return (long)SSL_CTX_get_num_tickets(((mts_ctx *)p)->ctx);
 }
 
 int mts_ctx_require_client_cert(void *p, const char *ca_pem_path) {
@@ -739,7 +754,7 @@ static void mts_alert_seen(const SSL *ssl, int where, int ret) {
         SSL_get_certificate(ssl) != NULL) {
         s->sent_certificate = 1;
     }
-    if ((where & SSL_CB_READ_ALERT) == 0) return;
+    if ((where & SSL_CB_READ_ALERT) != SSL_CB_READ_ALERT) return;
     if ((ret >> 8) != SSL3_AL_FATAL) return;
     s->received_alert = ret & 0xff;
 }
@@ -826,15 +841,95 @@ int mts_ssl_connect(void *s) {
     return result;
 }
 
-/* TLS 1.3 completes the client handshake before the server judges the
- * client certificate, and the server sends its session tickets only after
- * that check passes. So a client that sent a certificate is confirmed by the
- * server's first post-handshake record: a ticket or application data
- * accepts, a fatal alert rejects. A blocking socket waits as a blocking read
- * would, within SO_RCVTIMEO; a non-blocking one reports WANT_READ until the
- * record arrives. A server that disables tickets never confirms such a
- * client. */
-static int mts_confirm_step(mts_ssl *s, int awaits_record) {
+/* Without the verdict option: TLS 1.3 can report SSL_connect success before a post-handshake alert
+ * (rejected client certificate) is processed. Peek without blocking. When
+ * this session presented a client certificate on a blocking socket, wait
+ * briefly for POLLIN so that alert is not missed. */
+static int mts_confirm_after_wait(mts_ssl *s) {
+    SSL *ssl = s->ssl;
+    int fd = SSL_get_fd(ssl);
+    if (fd < 0) return -SSL_ERROR_SYSCALL;
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -SSL_ERROR_SYSCALL;
+    int blocking = (flags & O_NONBLOCK) == 0;
+    int wait_for_alert = blocking && SSL_get_certificate(ssl) != NULL;
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -SSL_ERROR_SYSCALL;
+
+    unsigned char buf[1];
+    int result = 0;
+    int attempts = wait_for_alert ? 2 : 1;
+    int i;
+    for (i = 0; i < attempts; i++) {
+        if (i == 1) {
+            struct pollfd pfd;
+            memset(&pfd, 0, sizeof(pfd));
+            pfd.fd = fd;
+            pfd.events = POLLIN | POLLERR | POLLHUP;
+            int pr = poll(&pfd, 1, 50);
+            if (pr <= 0) break;
+        }
+        mts_sigpipe_guard guard;
+        if (mts_sigpipe_guard_begin(&guard) != 0) {
+            result = -SSL_ERROR_SYSCALL;
+            break;
+        }
+        ERR_clear_error();
+        errno = 0;
+        int n = SSL_peek(ssl, buf, 1);
+        int io_errno = errno;
+        if (n > 0) {
+            result = 0;
+            mts_sigpipe_guard_end(&guard, io_errno);
+            break;
+        }
+        int error = SSL_get_error(ssl, n);
+        mts_sigpipe_guard_end(&guard, io_errno);
+        if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
+            result = 0;
+            continue;
+        }
+        /* close_notify after a completed handshake is a clean EOF; the next
+         * SSL_read reports it again. Only a fatal alert rejects the
+         * session. */
+        if (error == SSL_ERROR_ZERO_RETURN) {
+            result = 0;
+            break;
+        }
+        result = -error;
+        break;
+    }
+    (void)fcntl(fd, F_SETFL, flags);
+    return result;
+}
+
+/* With the verdict option (mts_ctx_await_verdict): TLS 1.3 completes the
+ * client handshake before the server judges the client certificate, and
+ * such a server sends its first post-handshake record only after that
+ * check passes. So a client that sent a certificate waits for the verdict:
+ * a ticket or application data accepts, a fatal alert rejects, and an end
+ * of any kind before a record is a close. A blocking socket waits within
+ * SO_RCVTIMEO and must have one; a non-blocking one reports WANT_READ until
+ * the verdict, and its caller bounds the wait. */
+static int mts_verdict_failure(mts_ssl *s, int error, int io_errno) {
+    if (s->received_alert >= 0) return -MTS_REJECTED;
+    if (error == SSL_ERROR_ZERO_RETURN) return -MTS_PEER_CLOSED;
+    if (error == SSL_ERROR_SYSCALL) {
+        if (io_errno == 0 || io_errno == ECONNRESET || io_errno == EPIPE) {
+            return -MTS_PEER_CLOSED;
+        }
+        return -SSL_ERROR_SYSCALL;
+    }
+    if (error != SSL_ERROR_SSL) return -error;
+    unsigned long reason = ERR_peek_error();
+    if (ERR_GET_LIB(reason) == ERR_LIB_SSL &&
+        ERR_GET_REASON(reason) == SSL_R_UNEXPECTED_EOF_WHILE_READING) {
+        return -MTS_PEER_CLOSED;
+    }
+    return -SSL_ERROR_SSL;
+}
+
+static int mts_verdict_step(mts_ssl *s) {
     unsigned char buf[1];
     mts_sigpipe_guard guard;
     if (mts_sigpipe_guard_begin(&guard) != 0) return -SSL_ERROR_SYSCALL;
@@ -843,18 +938,19 @@ static int mts_confirm_step(mts_ssl *s, int awaits_record) {
     int n = SSL_peek(s->ssl, buf, 1);
     int io_errno = errno;
     int error = n > 0 ? SSL_ERROR_NONE : SSL_get_error(s->ssl, n);
-    mts_sigpipe_guard_end(&guard, io_errno);
-    if (n > 0) return 0;
-    /* close_notify after a completed handshake is a clean EOF; the next
-     * SSL_read reports it again. */
-    if (error == SSL_ERROR_ZERO_RETURN) return 0;
-    if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) {
-        return -error;
+    /* A ticket is the verdict even when the same read then meets an end
+     * or an error; the stream's next read reports those. */
+    int result = 0;
+    if (n <= 0 && !s->ticket_seen) {
+        int pending =
+            error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE;
+        result = pending ? -error : mts_verdict_failure(s, error, io_errno);
     }
-    if (awaits_record && !s->ticket_seen) return -error;
-    return 0;
+    mts_sigpipe_guard_end(&guard, io_errno);
+    return result;
 }
 
+/* Sets *timeout_ms to SO_RCVTIMEO, or -1 when the socket has none. */
 static int mts_receive_timeout_ms(int fd, int *timeout_ms) {
     struct timeval tv;
     socklen_t len = sizeof(tv);
@@ -874,9 +970,9 @@ static long mts_now_ms(void) {
     return (long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
-static int mts_await_record(mts_ssl *s, int fd, int timeout_ms) {
+static int mts_await_verdict(mts_ssl *s, int fd, int timeout_ms) {
     long deadline_ms = timeout_ms < 0 ? -1 : mts_now_ms() + timeout_ms;
-    int result = mts_confirm_step(s, 1);
+    int result = mts_verdict_step(s);
     while (result == -SSL_ERROR_WANT_READ || result == -SSL_ERROR_WANT_WRITE) {
         int wait_ms = -1;
         if (deadline_ms >= 0) {
@@ -898,28 +994,31 @@ static int mts_await_record(mts_ssl *s, int fd, int timeout_ms) {
             errno = EAGAIN;
             return -SSL_ERROR_SYSCALL;
         }
-        result = mts_confirm_step(s, 1);
+        result = mts_verdict_step(s);
     }
     return result;
 }
 
+/* Returns 0 when the session stands, -MTS_REJECTED on a fatal alert,
+ * -MTS_PEER_CLOSED on an end before the verdict, -MTS_UNBOUNDED for a
+ * blocking socket with no SO_RCVTIMEO, WANT_READ or WANT_WRITE while a
+ * non-blocking verdict is pending, or the negated SSL_get_error class; a
+ * blocking verdict past SO_RCVTIMEO is SYSCALL with EAGAIN. */
 int mts_ssl_confirm_connect(void *p) {
     mts_ssl *s = (mts_ssl *)p;
+    int awaits_verdict = s->config->await_verdict && s->sent_certificate &&
+                         SSL_version(s->ssl) == TLS1_3_VERSION;
+    if (!awaits_verdict) return mts_confirm_after_wait(s);
     int fd = SSL_get_fd(s->ssl);
     if (fd < 0) return -SSL_ERROR_SYSCALL;
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) return -SSL_ERROR_SYSCALL;
-    int blocking = (flags & O_NONBLOCK) == 0;
-    int awaits_record =
-        s->sent_certificate && SSL_version(s->ssl) == TLS1_3_VERSION;
-    if (!blocking) return mts_confirm_step(s, awaits_record);
+    if ((flags & O_NONBLOCK) != 0) return mts_verdict_step(s);
     int timeout_ms = -1;
-    if (awaits_record && mts_receive_timeout_ms(fd, &timeout_ms) != 0) {
-        return -SSL_ERROR_SYSCALL;
-    }
+    if (mts_receive_timeout_ms(fd, &timeout_ms) != 0) return -SSL_ERROR_SYSCALL;
+    if (timeout_ms < 0) return -MTS_UNBOUNDED;
     if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -SSL_ERROR_SYSCALL;
-    int result = awaits_record ? mts_await_record(s, fd, timeout_ms)
-                               : mts_confirm_step(s, 0);
+    int result = mts_await_verdict(s, fd, timeout_ms);
     int io_errno = errno;
     (void)fcntl(fd, F_SETFL, flags);
     errno = io_errno;

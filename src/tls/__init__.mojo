@@ -35,10 +35,12 @@ def main() raises:
 
 from .tls import (
     PeerCertificate,
+    REJECTED_ERROR,
     SubjectAlternativeNames,
     TLSAlert,
     TLSContext,
     TLSHandshake,
     TLSSession,
     TLSStream,
+    is_rejection,
 )

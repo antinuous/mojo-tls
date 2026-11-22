@@ -2,14 +2,21 @@
 
 ## Unreleased
 
-- A TLS 1.3 client that sent a certificate completes its handshake only
-  on the server's first post-handshake record. A session ticket or data
-  accepts it, and a fatal alert rejects it in `advance()` or `connect()`
-  rather than on a later read, where a reset could discard it. This
-  replaces a 50 ms wait for the alert. The server must send session
-  tickets, which mojo-tls servers do. A non-blocking handshake reports
-  `wants_read()` until that record arrives; a blocking one waits within
-  its read timeout.
+- `TLSContext.client(server_tickets_after_verify=True)` makes a TLS 1.3
+  client that sent a certificate complete its handshake only on the
+  server's verdict, the first post-handshake record. A session ticket
+  accepts; a fatal alert raises `REJECTED_ERROR` (check it with
+  `is_rejection()`); an end before any record raises
+  `CONNECTION_RESET_ERROR`; a blocking socket's read timeout raises the
+  typed timeout, and a blocking socket without one is refused. Use it
+  only with servers that send their tickets after verifying the client
+  certificate, as mojo-tls servers do. Off by default, which keeps the
+  50 ms wait for a post-handshake alert.
+- A server context that requires client certificates aborts at start if
+  it would send no TLS 1.3 tickets, since such clients wait for them.
+- `received_alert()` records only alerts the peer sent. A fatal alert this
+  side sent was recorded too, so a local failure could read as the peer's
+  rejection.
 - `TLSHandshake.verify_error()` returns the X509 error code when this
   side refused the peer's certificate, so a caller tells its own
   rejection from a peer's alert or a closed connection.

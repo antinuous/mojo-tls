@@ -4,9 +4,11 @@
 # typed WANT_READ and WANT_WRITE states, and clean EOF.
 
 from std.ffi import c_int, external_call
+from std.time import perf_counter_ns
 from std.testing import assert_equal, assert_false, assert_true
 
 from net import (
+    CONNECTION_RESET_ERROR,
     Poller,
     ReadinessStream,
     TCPListener,
@@ -17,11 +19,13 @@ from net import (
 )
 from tls import (
     PeerCertificate,
+    REJECTED_ERROR,
     TLSAlert,
     TLSContext,
     TLSHandshake,
     TLSSession,
     TLSStream,
+    is_rejection,
 )
 
 
@@ -218,6 +222,19 @@ def step_until_done(mut handshake: TLSHandshake) raises:
     assert_true(False, "the handshake step completes")
 
 
+def step_until_error(mut handshake: TLSHandshake) raises -> String:
+    for _ in range(16):
+        if handshake.wants_read():
+            await_readable(handshake.descriptor())
+        try:
+            if handshake.advance():
+                break
+        except error:
+            return String(error)
+    assert_true(False, "the handshake step raises")
+    return ""
+
+
 def step_until_raises(mut handshake: TLSHandshake) raises:
     for _ in range(16):
         if handshake.wants_read():
@@ -330,6 +347,7 @@ def certificate_client_context(
         cert_chain_pem=String(cert),
         key_pem=String(key),
         alpn=["h2"],
+        server_tickets_after_verify=True,
     )
 
 
@@ -372,6 +390,8 @@ def test_certificate_client_completes_on_the_ticket() raises:
 
 
 def test_certificate_client_meets_the_rejection_in_the_handshake() raises:
+    # The server is dropped after its alert with the client's flight
+    # unread, so a reset follows the alert.
     var listener = TCPListener("127.0.0.1", 0)
     var client_tcp = TCPStream.connect("127.0.0.1", listener.local_port)
     var server_tcp = listener.accept()
@@ -387,11 +407,36 @@ def test_certificate_client_meets_the_rejection_in_the_handshake() raises:
     step_to_the_judgement(client, server)
     step_until_raises(server)
     assert_true(Bool(server.verify_error()), "the server refused the chain")
-    step_until_raises(client)
+    var error = step_until_error(client)
+    assert_equal(error, REJECTED_ERROR)
     assert_false(Bool(client.verify_error()), "the client refused nothing")
     var alert = client.received_alert()
     assert_true(Bool(alert), "the rejection is a received alert")
     assert_equal(alert.value(), TLSAlert.unknown_ca)
+
+
+def test_certificate_client_meets_the_alert_with_the_server_open() raises:
+    # The server stays open after its alert, so no reset follows it.
+    var listener = TCPListener("127.0.0.1", 0)
+    var client_tcp = TCPStream.connect("127.0.0.1", listener.local_port)
+    var server_tcp = listener.accept()
+    listener.close()
+    client_tcp.set_nonblocking(True)
+    server_tcp.set_nonblocking(True)
+    var server_ctx = judging_server_context()
+    var client_ctx = certificate_client_context(
+        UNTRUSTED_CLIENT_CERT, UNTRUSTED_CLIENT_KEY
+    )
+    var client = client_ctx.start_connect(client_tcp^, "localhost")
+    var server = server_ctx.start_accept(server_tcp^)
+    step_to_the_judgement(client, server)
+    step_until_raises(server)
+    var error = step_until_error(client)
+    assert_equal(error, REJECTED_ERROR)
+    var alert = client.received_alert()
+    assert_true(Bool(alert), "the rejection is a received alert")
+    assert_equal(alert.value(), TLSAlert.unknown_ca)
+    assert_false(server.is_complete(), "the server stayed open")
 
 
 def test_certificate_client_fails_when_the_server_closes_unjudged() raises:
@@ -407,8 +452,126 @@ def test_certificate_client_fails_when_the_server_closes_unjudged() raises:
     var server = server_ctx.start_accept(server_tcp^)
     step_to_the_judgement(client, server)
     _ = server^
-    step_until_raises(client)
+    var error = step_until_error(client)
+    assert_equal(error, CONNECTION_RESET_ERROR)
     assert_false(Bool(client.received_alert()), "a close is not an alert")
+
+
+def await_hangup(fd: c_int) raises:
+    # The peer's FIN follows every byte it sent, so once it is seen the
+    # whole of the peer's output is queued here.
+    # Readability is level-triggered and fires before the FIN lands, so
+    # the wait is bounded by time rather than by wakeups.
+    var poller = Poller()
+    poller.register(fd, readable=True, writable=False)
+    var deadline_ns = perf_counter_ns() + 2_000_000_000
+    while perf_counter_ns() < deadline_ns:
+        var events = poller.wait(2000)
+        for event in events:
+            if event.hangup:
+                poller.unregister(fd)
+                return
+    assert_true(False, "the peer's close arrives")
+
+
+def test_certificate_client_takes_the_ticket_and_close_in_one_read() raises:
+    var listener = TCPListener("127.0.0.1", 0)
+    var client_tcp = TCPStream.connect("127.0.0.1", listener.local_port)
+    var server_tcp = listener.accept()
+    listener.close()
+    client_tcp.set_nonblocking(True)
+    server_tcp.set_nonblocking(True)
+    var server_ctx = judging_server_context()
+    var client_ctx = certificate_client_context(CLIENT_CERT, CLIENT_KEY)
+    var client = client_ctx.start_connect(client_tcp^, "localhost")
+    var server = server_ctx.start_accept(server_tcp^)
+    step_to_the_judgement(client, server)
+    step_until_done(server)
+    var peer = server^.finish()
+    peer.close()
+    await_hangup(client.descriptor())
+    assert_true(client.advance(), "the ticket is the verdict")
+    var stream = client^.finish()
+    var buf = List[Byte](length=16, fill=0)
+    assert_equal(stream.read(buf), 0, "close_notify reads as clean EOF")
+    stream.close()
+
+
+def test_certificate_client_fails_when_the_server_ends_with_a_fin() raises:
+    var listener = TCPListener("127.0.0.1", 0)
+    var client_tcp = TCPStream.connect("127.0.0.1", listener.local_port)
+    var server_tcp = listener.accept()
+    listener.close()
+    client_tcp.set_nonblocking(True)
+    server_tcp.set_nonblocking(True)
+    var server_ctx = judging_server_context()
+    var client_ctx = certificate_client_context(CLIENT_CERT, CLIENT_KEY)
+    var client = client_ctx.start_connect(client_tcp^, "localhost")
+    var server = server_ctx.start_accept(server_tcp^)
+    step_to_the_judgement(client, server)
+    comptime SHUT_WR = 1
+    assert_equal(
+        external_call["shutdown", c_int](server.descriptor(), c_int(SHUT_WR)),
+        0,
+    )
+    var error = step_until_error(client)
+    assert_equal(error, CONNECTION_RESET_ERROR)
+    assert_false(Bool(client.received_alert()), "a close is not an alert")
+    assert_false(server.is_complete(), "the server never judged")
+
+
+def fork_stalled_server() raises -> Tuple[UInt16, c_int]:
+    # The child answers the ClientHello and then never reads the client's
+    # certificate, so no verdict ever comes.
+    var listener = TCPListener("127.0.0.1", 0)
+    var port = listener.local_port
+    var pid = external_call["fork", c_int]()
+    if pid == 0:
+        try:
+            var tcp = listener.accept()
+            tcp.set_nonblocking(True)
+            var server_ctx = judging_server_context()
+            var handshake = server_ctx.start_accept(tcp^)
+            await_readable(handshake.descriptor())
+            _ = handshake.advance()
+            _ = external_call["pause", c_int]()
+            _ = handshake.is_complete()
+        except:
+            pass
+        external_call["_exit", NoneType](c_int(0))
+    listener.close()
+    return (port, pid)
+
+
+def test_certificate_client_times_out_without_a_verdict() raises:
+    var server = fork_stalled_server()
+    var tcp = TCPStream.connect("127.0.0.1", server[0])
+    tcp.set_read_timeout(200_000_000)
+    var ctx = certificate_client_context(CLIENT_CERT, CLIENT_KEY)
+    var timed_out = False
+    try:
+        _ = ctx.connect(tcp^, "localhost")
+    except error:
+        timed_out = is_timeout_error(error)
+        assert_true(timed_out, String(error))
+    assert_true(timed_out, "the verdict wait ends at the read timeout")
+    _ = external_call["kill", c_int](server[1], c_int(9))
+    reap(server[1])
+
+
+def test_certificate_client_refuses_an_unbounded_verdict_wait() raises:
+    var server = fork_stalled_server()
+    var tcp = TCPStream.connect("127.0.0.1", server[0])
+    var ctx = certificate_client_context(CLIENT_CERT, CLIENT_KEY)
+    var refused = False
+    try:
+        _ = ctx.connect(tcp^, "localhost")
+    except error:
+        refused = "needs a read timeout" in String(error)
+        assert_true(refused, String(error))
+    assert_true(refused, "a blocking verdict wait needs a read timeout")
+    _ = external_call["kill", c_int](server[1], c_int(9))
+    reap(server[1])
 
 
 def test_reject_untrusted_client_certificate() raises:
@@ -424,15 +587,17 @@ def test_reject_untrusted_client_certificate() raises:
         cert_chain_pem=String(UNTRUSTED_CLIENT_CERT),
         key_pem=String(UNTRUSTED_CLIENT_KEY),
         alpn=["h2"],
+        server_tickets_after_verify=True,
     )
     var tcp = TCPStream.connect("127.0.0.1", server[0])
+    tcp.set_read_timeout(2_000_000_000)
     var handshake = ctx.start_connect(tcp^, "localhost")
     var raised = False
     try:
         _ = handshake.advance()
     except e:
         raised = True
-        assert_true("handshake" in String(e), String(e))
+        assert_true(is_rejection(e), String(e))
     assert_true(raised, "untrusted client certificate must fail connect")
     var alert = handshake.received_alert()
     assert_true(Bool(alert), "the blocking connect meets the alert")
@@ -489,41 +654,6 @@ def test_end_without_close_notify_is_a_typed_reset() raises:
         assert_true(is_connection_reset(error), String(error))
         reset = True
     assert_true(reset, "an end without close_notify is not a clean EOF")
-    stream.close()
-    reap(pid)
-
-
-def test_clean_close_right_after_client_cert_handshake() raises:
-    # The server sends its tickets before its close_notify, so the client's
-    # connect completes on the ticket and its first read is a clean EOF.
-    var listener = TCPListener("127.0.0.1", 0)
-    var port = listener.local_port
-    var pid = external_call["fork", c_int]()
-    if pid == 0:
-        try:
-            var ctx = TLSContext.server(
-                SERVER_CERT,
-                SERVER_KEY,
-                client_ca_file=CA,
-                require_client_cert=True,
-            )
-            var tcp = listener.accept()
-            var stream = ctx.accept(tcp^)
-            stream.close()
-        except:
-            pass
-        external_call["_exit", NoneType](c_int(0))
-    listener.close()
-
-    var ctx = TLSContext.client(
-        ca_file=String(CA),
-        cert_chain_pem=String(CLIENT_CERT),
-        key_pem=String(CLIENT_KEY),
-    )
-    var tcp = TCPStream.connect("127.0.0.1", port)
-    var stream = ctx.connect(tcp^, "localhost")
-    var buf = List[Byte](length=16, fill=0)
-    assert_equal(stream.read(buf), 0, "close_notify reads as clean EOF")
     stream.close()
     reap(pid)
 
@@ -1274,10 +1404,14 @@ def main() raises:
     test_reject_untrusted_client_certificate()
     test_certificate_client_completes_on_the_ticket()
     test_certificate_client_meets_the_rejection_in_the_handshake()
+    test_certificate_client_meets_the_alert_with_the_server_open()
     test_certificate_client_fails_when_the_server_closes_unjudged()
+    test_certificate_client_takes_the_ticket_and_close_in_one_read()
+    test_certificate_client_fails_when_the_server_ends_with_a_fin()
+    test_certificate_client_times_out_without_a_verdict()
+    test_certificate_client_refuses_an_unbounded_verdict_wait()
     test_clean_eof()
     test_end_without_close_notify_is_a_typed_reset()
-    test_clean_close_right_after_client_cert_handshake()
     test_reject_untrusted_ca()
     test_reject_wrong_hostname()
     test_hostname_wildcard_and_common_name()

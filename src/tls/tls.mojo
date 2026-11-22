@@ -29,7 +29,7 @@ the caller always watches the direction the TLS state machine actually needs.
 """
 
 from std.ffi import OwnedDLHandle, c_int
-from std.os import getenv
+from std.os import abort, getenv
 from std.pathlib import Path
 from std.sys import CompilationTarget
 
@@ -56,6 +56,31 @@ comptime _MAX_SESSION_DER = 16 * 1024
 comptime _MAX_ALPN_PROTOCOL = 255
 comptime _PEER_CLOSED = -100
 """The shim's `-MTS_PEER_CLOSED`: the stream ended with no close_notify."""
+comptime _REJECTED = -101
+"""The shim's `-MTS_REJECTED`: the server's fatal alert gave its verdict."""
+
+comptime _UNBOUNDED = -102
+"""The shim's `-MTS_UNBOUNDED`: a blocking verdict wait with no read timeout."""
+
+comptime REJECTED_ERROR = "tls: the peer rejected the handshake"
+"""The message of a handshake the peer refused with a fatal alert.
+
+Raised by a client context built with `server_tickets_after_verify` when
+the server's verdict on its certificate is an alert; read the alert with
+`received_alert()`. Check it with `is_rejection()`.
+"""
+
+
+def is_rejection(e: Error) -> Bool:
+    """Reports whether an error is a handshake the peer refused.
+
+    Args:
+        e: The error to inspect.
+
+    Returns:
+        True exactly for `REJECTED_ERROR`.
+    """
+    return String(e) == REJECTED_ERROR
 
 
 def _shim_filename() -> String:
@@ -296,6 +321,7 @@ struct TLSContext(Movable):
         cert_chain_pem: StringSpan = "",
         key_pem: StringSpan = "",
         alpn: List[String] = List[String](),
+        server_tickets_after_verify: Bool = False,
     ) raises -> TLSContext:
         """Builds a client-side context.
 
@@ -309,6 +335,18 @@ struct TLSContext(Movable):
             key_pem: Path to the unencrypted private key for `cert_chain_pem`.
                 Encrypted keys fail without prompting for a passphrase.
             alpn: Protocols to offer, most preferred first (e.g. "h2").
+            server_tickets_after_verify: Set only when every server this
+                context connects to sends its first TLS 1.3 post-handshake
+                record (a session ticket) only after it verified the client
+                certificate, as a mojo-tls server requiring client
+                certificates does. A handshake that sent a certificate then
+                completes on the server's verdict: a ticket accepts, a fatal
+                alert raises `REJECTED_ERROR`, an end before any record
+                raises `CONNECTION_RESET_ERROR`, and a blocking socket's
+                read timeout raises the typed timeout. A blocking socket
+                must have a read timeout; a non-blocking caller bounds its
+                own wait. A server that sends no ticket never confirms such
+                a client. Requires `cert_chain_pem`.
 
         Returns:
             The configured context.
@@ -319,6 +357,10 @@ struct TLSContext(Movable):
         if (cert_chain_pem.byte_length() == 0) != (key_pem.byte_length() == 0):
             raise Error(
                 "tls: client certificate and key must be provided together"
+            )
+        if server_tickets_after_verify and cert_chain_pem.byte_length() == 0:
+            raise Error(
+                "tls: server_tickets_after_verify needs a client certificate"
             )
         var lib = OwnedDLHandle(_shim_path())
         var ctx = lib.get_function[UInt64]("mts_ctx_new_client")()
@@ -354,6 +396,8 @@ struct TLSContext(Movable):
                 raise _shim_error(
                     out._lib, "tls: loading client certificate/key"
                 )
+        if server_tickets_after_verify:
+            out._lib.get_function[NoneType]("mts_ctx_await_verdict")(out._ctx)
         out._set_alpn(alpn)
         return out^
 
@@ -405,6 +449,15 @@ struct TLSContext(Movable):
             )(out._ctx, client_ca.as_c_string_span())
             if Int(rc) != 0:
                 raise _shim_error(out._lib, "tls: loading client CA")
+            var tickets = out._lib.get_function[Int]("mts_ctx_ticket_count")(
+                out._ctx
+            )
+            if tickets == 0:
+                abort(
+                    "tls: a server requiring client certificates sends"
+                    " tickets, which server_tickets_after_verify clients"
+                    " wait for"
+                )
         out._set_alpn(alpn)
         return out^
 
@@ -738,11 +791,11 @@ struct TLSHandshake(Movable):
         return _received_alert(self._lib, self._ssl)
 
     def verify_error(self) raises -> Optional[Int]:
-        """Returns why this side refused the peer's certificate, if it did.
+        """Returns why this side refused the peer's certificate chain.
 
         Returns:
-            The OpenSSL X509_V_ERR code, or None while the peer's chain
-            has not failed verification.
+            The OpenSSL X509_V_ERR code, or None while no chain has failed
+            verification, which includes a peer that sent no certificate.
 
         Raises:
             If the shim symbol cannot be resolved.
@@ -846,10 +899,9 @@ struct TLSHandshake(Movable):
     def advance(mut self) raises -> Bool:
         """Performs one handshake step without hiding readiness direction.
 
-        A TLS 1.3 client that sent a certificate completes only on the
-        server's first post-handshake record: a session ticket or data
-        accepts it and a fatal alert rejects it, so the rejection is met
-        here rather than on a later read. The server must send tickets.
+        A TLS 1.3 client of a `server_tickets_after_verify` context that
+        sent a certificate completes only on the server's verdict, so a
+        rejection is met here rather than on a later read.
 
         Returns:
             True when the TLS handshake is complete, or false when the
@@ -876,6 +928,15 @@ struct TLSHandshake(Movable):
                     return False
                 if Int(confirm) == _WANT_WRITE:
                     return False
+                if Int(confirm) == _REJECTED:
+                    raise Error(REJECTED_ERROR)
+                if Int(confirm) == _PEER_CLOSED:
+                    raise Error(CONNECTION_RESET_ERROR)
+                if Int(confirm) == _UNBOUNDED:
+                    raise Error(
+                        "tls: server_tickets_after_verify needs a read"
+                        " timeout on a blocking socket"
+                    )
                 if Int(confirm) != 0:
                     if Int(confirm) == _SYSCALL_ERROR:
                         raise os_error("tls handshake")
