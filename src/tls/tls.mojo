@@ -416,6 +416,34 @@ struct TLSContext(Movable):
         if Int(rc) < 0:
             raise _shim_error(self._lib, "tls: removing server name")
 
+    def set_raw_server_names(self, hosts: List[String]) raises:
+        """Replaces the SNI names whose handshakes negotiate no ALPN.
+
+        A raw TLS tunnel forwards the decrypted bytes unchanged, so it must
+        not agree to a protocol its upstream never chose. Matching is exact
+        and ASCII case-insensitive.
+
+        Args:
+            hosts: The DNS names; an empty list clears the set.
+
+        Raises:
+            If this is not a server context or a name holds a NUL byte.
+        """
+        if not self._is_server:
+            raise Error("tls: server names require a server context")
+        var names = List[Byte]()
+        for host in hosts:
+            for byte in host.as_bytes():
+                if byte == 0:
+                    raise Error("tls: server name holds a NUL byte")
+                names.append(byte)
+            names.append(0)
+        var rc = self._lib.get_function[c_int]("mts_ctx_set_raw_names")(
+            self._ctx, names.unsafe_ptr(), c_int(len(names))
+        )
+        if Int(rc) != 0:
+            raise Error("tls: setting raw server names")
+
     def connect(
         self,
         var tcp: TCPStream,
