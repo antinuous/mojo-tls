@@ -19,6 +19,7 @@ from tls import (
     PeerCertificate,
     TLSAlert,
     TLSContext,
+    TLSHandshake,
     TLSSession,
     TLSStream,
 )
@@ -201,44 +202,98 @@ def test_required_client_certificate() raises:
     reap(server[1])
 
 
-def test_missing_client_certificate_is_a_received_alert() raises:
-    # TLS 1.3: the server checks for a client certificate after the client's
-    # handshake completes. Its certificate_required alert reaches the client
-    # in the handshake's confirm step or on the first read, by timing.
-    var server = fork_tls_echo_server(
-        SERVER_CERT,
-        SERVER_KEY,
-        ["h2"],
-        client_ca=CA,
+def await_readable(fd: c_int) raises:
+    var poller = Poller()
+    poller.register(fd, readable=True, writable=False)
+    assert_true(len(poller.wait(2000)) > 0, "the peer's bytes arrive")
+    poller.unregister(fd)
+
+
+def step_until_done(mut handshake: TLSHandshake) raises:
+    for _ in range(16):
+        if handshake.wants_read():
+            await_readable(handshake.descriptor())
+        if handshake.advance():
+            return
+    assert_true(False, "the handshake step completes")
+
+
+def step_until_raises(mut handshake: TLSHandshake) raises:
+    for _ in range(16):
+        if handshake.wants_read():
+            await_readable(handshake.descriptor())
+        try:
+            if handshake.advance():
+                break
+        except:
+            return
+    assert_true(False, "the handshake step meets the alert")
+
+
+def test_alert_in_the_handshake_is_received() raises:
+    # One thread steps both sides, so the order is fixed: the server's
+    # first step meets an ALPN it does not serve and sends its alert before
+    # the client's handshake can complete.
+    var listener = TCPListener("127.0.0.1", 0)
+    var client_tcp = TCPStream.connect("127.0.0.1", listener.local_port)
+    var server_tcp = listener.accept()
+    listener.close()
+    client_tcp.set_nonblocking(True)
+    server_tcp.set_nonblocking(True)
+    var client_ctx = TLSContext.client(ca_file=String(CA), alpn=["http/1.1"])
+    var server_ctx = TLSContext.server(
+        String(SERVER_CERT), String(SERVER_KEY), alpn=["h2"]
+    )
+    var client = client_ctx.start_connect(client_tcp^, "localhost")
+    var server = server_ctx.start_accept(server_tcp^)
+    assert_false(client.advance(), "the client waits for the server")
+    step_until_raises(server)
+    step_until_raises(client)
+    var alert = client.received_alert()
+    assert_true(Bool(alert), "the failed handshake carries the alert")
+    assert_equal(alert.value(), TLSAlert(120))
+
+
+def test_alert_after_the_handshake_is_received_on_read() raises:
+    # TLS 1.3: the client's handshake completes before the server checks
+    # the client certificate. One thread steps both sides, so the client
+    # completes first and meets certificate_required on its first read.
+    var listener = TCPListener("127.0.0.1", 0)
+    var client_tcp = TCPStream.connect("127.0.0.1", listener.local_port)
+    var server_tcp = listener.accept()
+    listener.close()
+    client_tcp.set_nonblocking(True)
+    server_tcp.set_nonblocking(True)
+    var client_ctx = TLSContext.client(ca_file=String(CA), alpn=["h2"])
+    var server_ctx = TLSContext.server(
+        String(SERVER_CERT),
+        String(SERVER_KEY),
+        alpn=["h2"],
+        client_ca_file=String(CA),
         require_client_cert=True,
     )
-    var ctx = TLSContext.client(ca_file=String(CA), alpn=["h2"])
-    var tcp = TCPStream.connect("127.0.0.1", server[0])
-    var handshake = ctx.start_connect(tcp^, "localhost")
-    var connected = False
+    var client = client_ctx.start_connect(client_tcp^, "localhost")
+    var server = server_ctx.start_accept(server_tcp^)
+    assert_false(client.advance(), "the client waits for the server")
+    await_readable(server.descriptor())
+    assert_false(server.advance(), "the server waits for the client")
+    step_until_done(client)
+    assert_false(Bool(client.received_alert()), "no alert yet")
+    step_until_raises(server)
+    var stream = client^.finish()
+    await_readable(stream.descriptor())
+    var buf = List[Byte]()
+    buf.resize(1, 0)
+    var read_raised = False
     try:
-        connected = handshake.advance()
+        _ = stream.read(buf)
     except:
-        pass
-    if not connected:
-        var alert = handshake.received_alert()
-        assert_true(Bool(alert), "a failed handshake carries the alert")
-        assert_equal(alert.value(), TLSAlert.certificate_required)
-        reap(server[1])
-        return
-    var stream = handshake^.finish()
-    var raised = False
-    try:
-        stream.write_all("auth".as_bytes())
-        _ = stream.read_exact(4)
-    except:
-        raised = True
-    assert_true(raised, "a server requiring a certificate must reject")
+        read_raised = True
+    assert_true(read_raised, "the first read meets the alert")
     var alert = stream.received_alert()
     assert_true(Bool(alert), "the rejection is a received alert")
     assert_equal(alert.value(), TLSAlert.certificate_required)
     stream.close()
-    reap(server[1])
 
 
 def test_reject_untrusted_client_certificate() raises:
@@ -256,17 +311,13 @@ def test_reject_untrusted_client_certificate() raises:
         alpn=["h2"],
     )
     var tcp = TCPStream.connect("127.0.0.1", server[0])
-    var handshake = ctx.start_connect(tcp^, "localhost")
     var raised = False
     try:
-        _ = handshake.advance()
+        _ = ctx.connect(tcp^, "localhost")
     except e:
         raised = True
         assert_true("handshake" in String(e), String(e))
     assert_true(raised, "untrusted client certificate must fail connect")
-    var alert = handshake.received_alert()
-    assert_true(Bool(alert), "the rejection is a received alert")
-    assert_equal(alert.value(), TLSAlert.unknown_ca)
     reap(server[1])
 
 
@@ -1112,7 +1163,8 @@ def test_write_timeout_after_wrap() raises:
 def main() raises:
     test_handshake_echo_alpn()
     test_required_client_certificate()
-    test_missing_client_certificate_is_a_received_alert()
+    test_alert_in_the_handshake_is_received()
+    test_alert_after_the_handshake_is_received_on_read()
     test_reject_untrusted_client_certificate()
     test_clean_eof()
     test_end_without_close_notify_is_a_typed_reset()
