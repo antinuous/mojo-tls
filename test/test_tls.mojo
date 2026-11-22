@@ -494,6 +494,7 @@ def test_certificate_client_takes_the_ticket_and_close_in_one_read() raises:
     var stream = client^.finish()
     var buf = List[Byte](length=16, fill=0)
     assert_equal(stream.read(buf), 0, "close_notify reads as clean EOF")
+    assert_false(Bool(stream.received_alert()), "close_notify is no rejection")
     stream.close()
 
 
@@ -572,6 +573,33 @@ def test_certificate_client_refuses_an_unbounded_verdict_wait() raises:
     assert_true(refused, "a blocking verdict wait needs a read timeout")
     _ = external_call["kill", c_int](server[1], c_int(9))
     reap(server[1])
+
+
+def test_an_alert_this_side_sends_is_not_received() raises:
+    # The client refuses a self-signed server certificate and sends the
+    # fatal alert; only the server records it as received.
+    var listener = TCPListener("127.0.0.1", 0)
+    var client_tcp = TCPStream.connect("127.0.0.1", listener.local_port)
+    var server_tcp = listener.accept()
+    listener.close()
+    client_tcp.set_nonblocking(True)
+    server_tcp.set_nonblocking(True)
+    var client_ctx = TLSContext.client(ca_file=String(CA))
+    var server_ctx = TLSContext.server(
+        String(SELFSIGNED_CERT), String(SELFSIGNED_KEY)
+    )
+    var client = client_ctx.start_connect(client_tcp^, "localhost")
+    var server = server_ctx.start_accept(server_tcp^)
+    assert_false(client.advance(), "the client waits for the server")
+    await_readable(server.descriptor())
+    assert_false(server.advance(), "the server waits for the client")
+    step_until_raises(client)
+    assert_true(Bool(client.verify_error()), "the client refused the chain")
+    assert_false(Bool(client.received_alert()), "a sent alert is not received")
+    step_until_raises(server)
+    var alert = server.received_alert()
+    assert_true(Bool(alert), "the server received the client's alert")
+    assert_equal(alert.value(), TLSAlert.unknown_ca)
 
 
 def test_reject_untrusted_client_certificate() raises:
@@ -1401,6 +1429,7 @@ def main() raises:
     test_required_client_certificate()
     test_alert_in_the_handshake_is_received()
     test_alert_after_the_handshake_is_received_on_read()
+    test_an_alert_this_side_sends_is_not_received()
     test_reject_untrusted_client_certificate()
     test_certificate_client_completes_on_the_ticket()
     test_certificate_client_meets_the_rejection_in_the_handshake()
