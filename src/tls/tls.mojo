@@ -429,6 +429,25 @@ struct TLSContext(Movable):
         Raises:
             If this is not a server context or a name holds a NUL byte.
         """
+        self._set_names("mts_ctx_set_raw_names", hosts)
+
+    def set_h2_server_names(self, hosts: List[String]) raises:
+        """Replaces the SNI names whose handshakes agree to `h2` when the
+        client offers it, and to no protocol otherwise.
+
+        An h2 TLS tunnel forwards the decrypted bytes to an upstream that
+        speaks HTTP/2, so it agrees to nothing else. Matching is exact and
+        ASCII case-insensitive.
+
+        Args:
+            hosts: The DNS names; an empty list clears the set.
+
+        Raises:
+            If this is not a server context or a name holds a NUL byte.
+        """
+        self._set_names("mts_ctx_set_h2_names", hosts)
+
+    def _set_names(self, function: StaticString, hosts: List[String]) raises:
         if not self._is_server:
             raise Error("tls: server names require a server context")
         var names = List[Byte]()
@@ -438,11 +457,11 @@ struct TLSContext(Movable):
                     raise Error("tls: server name holds a NUL byte")
                 names.append(byte)
             names.append(0)
-        var rc = self._lib.get_function[c_int]("mts_ctx_set_raw_names")(
+        var rc = self._lib.get_function[c_int](function)(
             self._ctx, names.unsafe_ptr(), c_int(len(names))
         )
         if Int(rc) != 0:
-            raise Error("tls: setting raw server names")
+            raise Error(String("tls: ", function, " failed"))
 
     def connect(
         self,

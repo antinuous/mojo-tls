@@ -62,6 +62,9 @@ typedef struct {
     /* NUL-separated host names that negotiate no ALPN, under names_lock. */
     char *raw_names;
     int raw_names_len;
+    /* NUL-separated host names that negotiate only h2, under names_lock. */
+    char *h2_names;
+    int h2_names_len;
 } mts_ctx;
 
 typedef struct {
@@ -152,17 +155,26 @@ static void mts_sigpipe_guard_end(mts_sigpipe_guard *guard, int io_errno) {
 
 /* Server-side ALPN selection: pick the first protocol from our stored
  * list that the client offered. Fatal alert on no overlap, per RFC 7301. */
-static int mts_raw_name(mts_ctx *c, const char *host) {
+static int mts_name_listed(mts_ctx *c, char *const *names, const int *len,
+                           const char *host) {
     if (!host || !host[0]) return 0;
-    int raw = 0;
+    int found = 0;
     pthread_mutex_lock(&c->names_lock);
-    for (int at = 0; at < c->raw_names_len && !raw;) {
-        const char *name = c->raw_names + at;
-        raw = strcasecmp(name, host) == 0;
+    for (int at = 0; at < *len && !found;) {
+        const char *name = *names + at;
+        found = strcasecmp(name, host) == 0;
         at += (int)strlen(name) + 1;
     }
     pthread_mutex_unlock(&c->names_lock);
-    return raw;
+    return found;
+}
+
+static int mts_raw_name(mts_ctx *c, const char *host) {
+    return mts_name_listed(c, &c->raw_names, &c->raw_names_len, host);
+}
+
+static int mts_h2_name(mts_ctx *c, const char *host) {
+    return mts_name_listed(c, &c->h2_names, &c->h2_names_len, host);
 }
 
 static int mts_alpn_select(SSL *ssl, const unsigned char **out,
@@ -170,8 +182,16 @@ static int mts_alpn_select(SSL *ssl, const unsigned char **out,
                            unsigned int inlen, void *arg) {
     mts_ctx *c = (mts_ctx *)arg;
     if (c->alpn_len == 0) return SSL_TLSEXT_ERR_NOACK;
-    if (mts_raw_name(c, SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name)))
+    const char *host = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+    if (mts_raw_name(c, host)) return SSL_TLSEXT_ERR_NOACK;
+    if (mts_h2_name(c, host)) {
+        static const unsigned char h2_wire[] = {2, 'h', '2'};
+        if (SSL_select_next_proto((unsigned char **)out, outlen, h2_wire,
+                                  sizeof(h2_wire), in,
+                                  inlen) == OPENSSL_NPN_NEGOTIATED)
+            return SSL_TLSEXT_ERR_OK;
         return SSL_TLSEXT_ERR_NOACK;
+    }
     if (SSL_select_next_proto((unsigned char **)out, outlen, c->alpn_wire,
                               (unsigned int)c->alpn_len, in,
                               inlen) == OPENSSL_NPN_NEGOTIATED) {
@@ -337,6 +357,7 @@ static void mts_ctx_release(mts_ctx *c) {
         c->names = next;
     }
     free(c->raw_names);
+    free(c->h2_names);
     pthread_mutex_destroy(&c->names_lock);
     SSL_CTX_free(c->ctx);
     free(c);
@@ -491,10 +512,8 @@ int mts_ctx_add_server_name(void *server_ctx, const char *host,
     return 0;
 }
 
-/* Replaces the host names whose handshakes negotiate no ALPN. names holds
- * len bytes of NUL-terminated names back to back. Returns 0 or -1. */
-int mts_ctx_set_raw_names(void *server_ctx, const char *names, int len) {
-    mts_ctx *c = (mts_ctx *)server_ctx;
+static int mts_set_names(mts_ctx *c, char **slot, int *slot_len,
+                         const char *names, int len) {
     if (!c || len < 0 || (len > 0 && (!names || names[len - 1] != 0)))
         return -1;
     char *copy = NULL;
@@ -504,12 +523,29 @@ int mts_ctx_set_raw_names(void *server_ctx, const char *names, int len) {
         memcpy(copy, names, (size_t)len);
     }
     pthread_mutex_lock(&c->names_lock);
-    char *old = c->raw_names;
-    c->raw_names = copy;
-    c->raw_names_len = len;
+    char *old = *slot;
+    *slot = copy;
+    *slot_len = len;
     pthread_mutex_unlock(&c->names_lock);
     free(old);
     return 0;
+}
+
+/* Replaces the host names whose handshakes negotiate no ALPN. names holds
+ * len bytes of NUL-terminated names back to back. Returns 0 or -1. */
+int mts_ctx_set_raw_names(void *server_ctx, const char *names, int len) {
+    mts_ctx *c = (mts_ctx *)server_ctx;
+    if (!c) return -1;
+    return mts_set_names(c, &c->raw_names, &c->raw_names_len, names, len);
+}
+
+/* Replaces the host names whose handshakes agree to h2 when the client
+ * offers it and to nothing otherwise, in the format of
+ * mts_ctx_set_raw_names. Returns 0 or -1. */
+int mts_ctx_set_h2_names(void *server_ctx, const char *names, int len) {
+    mts_ctx *c = (mts_ctx *)server_ctx;
+    if (!c) return -1;
+    return mts_set_names(c, &c->h2_names, &c->h2_names_len, names, len);
 }
 
 /* Returns 0 when host was removed and 1 when it was not configured. */
