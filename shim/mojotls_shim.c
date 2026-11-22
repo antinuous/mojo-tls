@@ -97,6 +97,9 @@ typedef struct {
      * mts_ssl_confirm_connect). */
     int sent_certificate;
     int ticket_seen;
+    /* The hello that fixes the version has been processed; before it a
+     * client's SSL_version is the highest it offers. */
+    int version_fixed;
 } mts_ssl;
 
 #define MTS_MAX_PEER_CERT_DER (1024 * 1024)
@@ -748,21 +751,27 @@ void mts_ctx_free(void *p) {
 }
 
 /* close_notify and user_canceled end a session without refusing it and are
- * never recorded. TLS 1.2 acts only on fatal alerts. TLS 1.3 ignores the
- * level byte (RFC 8446 6) and fails on every other alert, so it records them
- * at either level. */
+ * never recorded. TLS 1.2, and any session before its version is fixed,
+ * acts only on fatal alerts. TLS 1.3 ignores the level byte (RFC 8446 6)
+ * and fails on every other alert, so it records them at either level. */
 static void mts_alert_seen(const SSL *ssl, int where, int ret) {
     mts_ssl *s = (mts_ssl *)SSL_get_app_data(ssl);
     if ((where & SSL_CB_LOOP) != 0 && SSL_get_state(ssl) == TLS_ST_CW_CERT &&
         SSL_get_certificate(ssl) != NULL) {
         s->sent_certificate = 1;
     }
+    if ((where & SSL_CB_LOOP) != 0 &&
+        (SSL_get_state(ssl) == TLS_ST_CR_SRVR_HELLO ||
+         SSL_get_state(ssl) == TLS_ST_SR_CLNT_HELLO)) {
+        s->version_fixed = 1;
+    }
     if ((where & SSL_CB_READ_ALERT) != SSL_CB_READ_ALERT) return;
     int level = ret >> 8;
     int description = ret & 0xff;
     if (description == SSL_AD_CLOSE_NOTIFY) return;
     if (description == SSL_AD_USER_CANCELLED) return;
-    if (level != SSL3_AL_FATAL && SSL_version(ssl) != TLS1_3_VERSION) return;
+    int tls13 = s->version_fixed && SSL_version(ssl) == TLS1_3_VERSION;
+    if (level != SSL3_AL_FATAL && !tls13) return;
     s->received_alert = description;
 }
 
