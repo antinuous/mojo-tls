@@ -3,8 +3,9 @@
 
 tls depends on mojo-net; its src/ path is resolved the same way as
 tools/dep_src.py: $MOJO_DEPS_DIR, .deps/ (fetch_deps.py), or a sibling
-../mojo-net checkout. Tests run from the package root so the shim and
-cert fixtures resolve at build/.
+../mojo-net checkout. Tests run from the package root so the cert fixtures
+resolve at build/. The library loads its shim only from MOJO_TLS_SHIM,
+which pixi's activation sets to the shim build_shim.sh writes.
 """
 
 import os
@@ -34,6 +35,9 @@ def main() -> int:
     subprocess.run(
         ["bash", str(ROOT / "tools" / "gen_test_certs.sh")], check=True
     )
+    shim = Path(os.environ.get("MOJO_TLS_SHIM", ""))
+    if not shim.is_file():
+        sys.exit(f"MOJO_TLS_SHIM names no built shim: '{shim}'")
     net = net_src()
     failed = 0
     for t in sorted((ROOT / "test").glob("test_*.mojo")):
