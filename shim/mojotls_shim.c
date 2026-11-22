@@ -868,3 +868,143 @@ int mts_last_error(char *buf, int cap) {
     ERR_error_string_n(e, buf, (size_t)cap);
     return (int)strlen(buf);
 }
+
+/* Certificate issuance for TLS-terminating proxies: a CA kept by the
+ * proxy, and a leaf per server name signed by it. Private keys are written
+ * mode 0600 and certificates hold the leaf followed by the CA. */
+
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/rand.h>
+#include <stdio.h>
+#include <unistd.h>
+
+#define MTS_CA_NOT_BEFORE "19750101000000Z"
+#define MTS_CA_NOT_AFTER "40960101000000Z"
+#define MTS_LEAF_DAYS 397
+
+static int mts_write_key(const char *path, EVP_PKEY *key) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return -1;
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        return -1;
+    }
+    int ok = PEM_write_PrivateKey(f, key, NULL, NULL, 0, NULL, NULL);
+    return (fclose(f) == 0 && ok == 1) ? 0 : -1;
+}
+
+static int mts_write_certs(const char *path, X509 *first, X509 *second) {
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    int ok = PEM_write_X509(f, first);
+    if (ok == 1 && second) ok = PEM_write_X509(f, second);
+    return (fclose(f) == 0 && ok == 1) ? 0 : -1;
+}
+
+static int mts_add_ext(X509 *cert, X509 *issuer, int nid, const char *value) {
+    X509V3_CTX ctx;
+    X509V3_set_ctx_nodb(&ctx);
+    X509V3_set_ctx(&ctx, issuer, cert, NULL, NULL, 0);
+    X509_EXTENSION *ext = X509V3_EXT_conf_nid(NULL, &ctx, nid, value);
+    if (!ext) return -1;
+    int ok = X509_add_ext(cert, ext, -1);
+    X509_EXTENSION_free(ext);
+    return ok == 1 ? 0 : -1;
+}
+
+static X509 *mts_cert_new(EVP_PKEY *key, const char *cn, long days) {
+    X509 *cert = X509_new();
+    if (!cert) return NULL;
+    unsigned char serial[16];
+    BIGNUM *bn = NULL;
+    int ok = X509_set_version(cert, 2) == 1 &&
+             RAND_bytes(serial, sizeof serial) == 1;
+    if (ok) {
+        serial[0] &= 0x7f;
+        bn = BN_bin2bn(serial, sizeof serial, NULL);
+        ok = bn && BN_to_ASN1_INTEGER(bn, X509_get_serialNumber(cert));
+    }
+    BN_free(bn);
+    ok = ok && X509_gmtime_adj(X509_getm_notBefore(cert), -3600) &&
+         X509_gmtime_adj(X509_getm_notAfter(cert), days * 86400L) &&
+         X509_set_pubkey(cert, key) == 1 &&
+         X509_NAME_add_entry_by_txt(X509_get_subject_name(cert), "CN",
+                                    MBSTRING_UTF8, (const unsigned char *)cn,
+                                    -1, -1, 0) == 1;
+    if (!ok) {
+        X509_free(cert);
+        return NULL;
+    }
+    return cert;
+}
+
+int mts_ca_new(const char *common_name, const char *cert_path,
+               const char *key_path) {
+    EVP_PKEY *key = EVP_EC_gen("P-256");
+    if (!key) return -1;
+    X509 *cert = mts_cert_new(key, common_name, 0);
+    int ok = cert &&
+             ASN1_TIME_set_string_X509(X509_getm_notBefore(cert), MTS_CA_NOT_BEFORE) == 1 &&
+             ASN1_TIME_set_string_X509(X509_getm_notAfter(cert), MTS_CA_NOT_AFTER) == 1 &&
+             X509_set_issuer_name(cert, X509_get_subject_name(cert)) == 1 &&
+             mts_add_ext(cert, cert, NID_basic_constraints,
+                         "critical,CA:TRUE,pathlen:0") == 0 &&
+             mts_add_ext(cert, cert, NID_key_usage,
+                         "critical,keyCertSign,cRLSign") == 0 &&
+             mts_add_ext(cert, cert, NID_subject_key_identifier, "hash") == 0 &&
+             X509_sign(cert, key, EVP_sha256()) > 0 &&
+             mts_write_key(key_path, key) == 0 &&
+             mts_write_certs(cert_path, cert, NULL) == 0;
+    X509_free(cert);
+    EVP_PKEY_free(key);
+    return ok ? 0 : -1;
+}
+
+static int mts_is_ip(const char *name) {
+    unsigned char buf[16];
+    return inet_pton(AF_INET, name, buf) == 1 ||
+           inet_pton(AF_INET6, name, buf) == 1;
+}
+
+int mts_leaf_issue(const char *ca_cert_path, const char *ca_key_path,
+                   const char *server_name, const char *cert_path,
+                   const char *key_path) {
+    FILE *f = fopen(ca_cert_path, "r");
+    if (!f) return -1;
+    X509 *ca = PEM_read_X509(f, NULL, NULL, NULL);
+    fclose(f);
+    f = fopen(ca_key_path, "r");
+    if (!f) {
+        X509_free(ca);
+        return -1;
+    }
+    EVP_PKEY *ca_key = PEM_read_PrivateKey(f, NULL, mts_reject_password, NULL);
+    fclose(f);
+    EVP_PKEY *key = EVP_EC_gen("P-256");
+    X509 *cert = NULL;
+    char san[300];
+    int ok = ca && ca_key && key &&
+             strlen(server_name) < sizeof san - 4;
+    if (ok) {
+        snprintf(san, sizeof san, "%s:%s", mts_is_ip(server_name) ? "IP" : "DNS",
+                 server_name);
+        cert = mts_cert_new(key, server_name, MTS_LEAF_DAYS);
+    }
+    ok = ok && cert &&
+         X509_set_issuer_name(cert, X509_get_subject_name(ca)) == 1 &&
+         mts_add_ext(cert, ca, NID_basic_constraints, "critical,CA:FALSE") == 0 &&
+         mts_add_ext(cert, ca, NID_key_usage, "critical,digitalSignature") == 0 &&
+         mts_add_ext(cert, ca, NID_ext_key_usage, "serverAuth") == 0 &&
+         mts_add_ext(cert, ca, NID_subject_alt_name, san) == 0 &&
+         mts_add_ext(cert, ca, NID_authority_key_identifier, "keyid") == 0 &&
+         X509_sign(cert, ca_key, EVP_sha256()) > 0 &&
+         mts_write_key(key_path, key) == 0 &&
+         mts_write_certs(cert_path, cert, ca) == 0;
+    X509_free(cert);
+    X509_free(ca);
+    EVP_PKEY_free(ca_key);
+    EVP_PKEY_free(key);
+    return ok ? 0 : -1;
+}
