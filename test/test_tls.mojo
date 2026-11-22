@@ -414,6 +414,10 @@ def test_certificate_client_reads_the_alert_before_the_reset() raises:
     assert_equal(alert.value(), TLSAlert.unknown_ca)
     assert_true(Bool(server.verify_error()), "the server refused the chain")
     assert_false(Bool(client.verify_error()), "the client refused nothing")
+    var sent = server.sent_alert()
+    assert_true(Bool(sent), "the refusing server records its alert as sent")
+    assert_equal(sent.value(), TLSAlert.unknown_ca)
+    assert_false(Bool(client.sent_alert()), "the refused client sent none")
     _ = server^
 
 
@@ -476,6 +480,7 @@ def test_certificate_client_takes_the_ticket_and_close_in_one_read() raises:
     var buf = List[Byte](length=16, fill=0)
     assert_equal(stream.read(buf), 0, "close_notify reads as clean EOF")
     assert_false(Bool(stream.received_alert()), "close_notify is no rejection")
+    assert_false(Bool(stream.sent_alert()), "the client refused nothing")
     stream.close()
 
 
@@ -544,9 +549,10 @@ def test_certificate_client_times_out_without_a_verdict() raises:
     reap(server[1])
 
 
-def test_an_alert_this_side_sends_is_not_received() raises:
+def test_an_alert_is_sent_by_one_side_and_received_by_the_other() raises:
     # The client refuses a self-signed server certificate and sends the
-    # fatal alert; only the server records it as received.
+    # fatal alert: the client records it as sent only, the server as
+    # received only.
     var listener = TCPListener("127.0.0.1", 0)
     var client_tcp = TCPStream.connect("127.0.0.1", listener.local_port)
     var server_tcp = listener.accept()
@@ -565,10 +571,14 @@ def test_an_alert_this_side_sends_is_not_received() raises:
     step_until_raises(client)
     assert_true(Bool(client.verify_error()), "the client refused the chain")
     assert_false(Bool(client.received_alert()), "a sent alert is not received")
+    var sent = client.sent_alert()
+    assert_true(Bool(sent), "the client records the alert it sent")
+    assert_equal(sent.value(), TLSAlert.unknown_ca)
     step_until_raises(server)
     var alert = server.received_alert()
     assert_true(Bool(alert), "the server received the client's alert")
     assert_equal(alert.value(), TLSAlert.unknown_ca)
+    assert_false(Bool(server.sent_alert()), "a received alert is not sent")
 
 
 def test_reject_untrusted_client_certificate() raises:
@@ -1398,7 +1408,7 @@ def main() raises:
     test_required_client_certificate()
     test_alert_in_the_handshake_is_received()
     test_alert_after_the_handshake_is_received_on_read()
-    test_an_alert_this_side_sends_is_not_received()
+    test_an_alert_is_sent_by_one_side_and_received_by_the_other()
     test_reject_untrusted_client_certificate()
     test_certificate_client_completes_on_the_ticket()
     test_certificate_client_reads_the_alert_before_the_reset()

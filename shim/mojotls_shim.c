@@ -90,8 +90,11 @@ typedef struct {
     mts_ctx *config;
     int hello;
     char requested_name[TLSEXT_MAXLEN_host_name + 1];
-    /* The description of the last fatal alert the peer sent, or -1. */
+    /* The description of the last alert the peer sent, and of the last
+     * alert this side sent, that refused the session, or -1 (see
+     * mts_alert_kept). */
     int received_alert;
+    int sent_alert;
     /* A client with a certificate configured that answered a certificate
      * request, and one that then received a session ticket (see
      * mts_ssl_confirm_connect). */
@@ -750,10 +753,20 @@ void mts_ctx_free(void *p) {
     mts_ctx_release(c);
 }
 
-/* close_notify and user_canceled end a session without refusing it and are
- * never recorded. TLS 1.2, and any session before its version is fixed,
- * acts only on fatal alerts. TLS 1.3 ignores the level byte (RFC 8446 6)
- * and fails on every other alert, so it records them at either level. */
+/* The description of an alert that refuses the session, or -1. close_notify
+ * and user_canceled end a session without refusing it. TLS 1.2, and any
+ * session before its version is fixed, acts only on fatal alerts. TLS 1.3
+ * ignores the level byte (RFC 8446 6) and fails on every other alert. */
+static int mts_alert_kept(const SSL *ssl, const mts_ssl *s, int ret) {
+    int level = ret >> 8;
+    int description = ret & 0xff;
+    if (description == SSL_AD_CLOSE_NOTIFY) return -1;
+    if (description == SSL_AD_USER_CANCELLED) return -1;
+    int tls13 = s->version_fixed && SSL_version(ssl) == TLS1_3_VERSION;
+    if (level != SSL3_AL_FATAL && !tls13) return -1;
+    return description;
+}
+
 static void mts_alert_seen(const SSL *ssl, int where, int ret) {
     mts_ssl *s = (mts_ssl *)SSL_get_app_data(ssl);
     if ((where & SSL_CB_LOOP) != 0 && SSL_get_state(ssl) == TLS_ST_CW_CERT &&
@@ -765,14 +778,14 @@ static void mts_alert_seen(const SSL *ssl, int where, int ret) {
          SSL_get_state(ssl) == TLS_ST_SR_CLNT_HELLO)) {
         s->version_fixed = 1;
     }
-    if ((where & SSL_CB_READ_ALERT) != SSL_CB_READ_ALERT) return;
-    int level = ret >> 8;
-    int description = ret & 0xff;
-    if (description == SSL_AD_CLOSE_NOTIFY) return;
-    if (description == SSL_AD_USER_CANCELLED) return;
-    int tls13 = s->version_fixed && SSL_version(ssl) == TLS1_3_VERSION;
-    if (level != SSL3_AL_FATAL && !tls13) return;
-    s->received_alert = description;
+    int kept = mts_alert_kept(ssl, s, ret);
+    if (kept < 0) return;
+    if ((where & SSL_CB_READ_ALERT) == SSL_CB_READ_ALERT) {
+        s->received_alert = kept;
+    }
+    if ((where & SSL_CB_WRITE_ALERT) == SSL_CB_WRITE_ALERT) {
+        s->sent_alert = kept;
+    }
 }
 
 static int mts_ticket_seen(SSL *ssl, SSL_SESSION *session) {
@@ -795,6 +808,7 @@ void *mts_ssl_new(void *p, int fd) {
     s->hello = MTS_HELLO_FIRST;
     s->requested_name[0] = 0;
     s->received_alert = -1;
+    s->sent_alert = -1;
     SSL_set_app_data(s->ssl, s);
     SSL_set_info_callback(s->ssl, mts_alert_seen);
     atomic_fetch_add_explicit(&c->refs, 1, memory_order_relaxed);
@@ -1099,6 +1113,11 @@ int mts_ssl_write(void *s, const unsigned char *buf, int len) {
 /* The description of the last fatal alert received, or -1 for none. */
 int mts_ssl_received_alert(void *s) {
     return ((mts_ssl *)s)->received_alert;
+}
+
+/* The description of the last refusing alert this side sent, or -1. */
+int mts_ssl_sent_alert(void *s) {
+    return ((mts_ssl *)s)->sent_alert;
 }
 
 int mts_ssl_wants_read(void *s) {

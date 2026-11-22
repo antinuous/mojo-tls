@@ -294,10 +294,10 @@ struct TLSAlert(Equatable, ImplicitlyCopyable, Movable, Writable):
         writer.write("tls alert ", self.code)
 
 
-def _received_alert(
-    lib: OwnedDLHandle, ssl: UInt64
+def _alert(
+    lib: OwnedDLHandle, symbol: StaticString, ssl: UInt64
 ) raises -> Optional[TLSAlert]:
-    var code = Int(lib.get_function[c_int]("mts_ssl_received_alert")(ssl))
+    var code = Int(lib.get_function[c_int](symbol)(ssl))
     if code < 0:
         return None
     return TLSAlert(UInt8(code))
@@ -801,7 +801,21 @@ struct TLSHandshake(Movable):
         Raises:
             If the shim symbol cannot be resolved.
         """
-        return _received_alert(self._lib, self._ssl)
+        return _alert(self._lib, "mts_ssl_received_alert", self._ssl)
+
+    def sent_alert(self) raises -> Optional[TLSAlert]:
+        """Returns the last alert this side sent that refused the session.
+
+        The level and version rules match `received_alert()`: close_notify
+        and user_canceled are never recorded.
+
+        Returns:
+            The alert, or None when this side refused nothing by alert.
+
+        Raises:
+            If the shim symbol cannot be resolved.
+        """
+        return _alert(self._lib, "mts_ssl_sent_alert", self._ssl)
 
     def verify_error(self) raises -> Optional[Int]:
         """Returns why this side refused the peer's certificate chain.
@@ -1072,7 +1086,21 @@ struct TLSStream(ReadinessStream):
         Raises:
             If the shim symbol cannot be resolved.
         """
-        return _received_alert(self._lib, self._ssl)
+        return _alert(self._lib, "mts_ssl_received_alert", self._ssl)
+
+    def sent_alert(self) raises -> Optional[TLSAlert]:
+        """Returns the last alert this side sent that refused the session.
+
+        The level and version rules match `received_alert()`: close_notify
+        and user_canceled are never recorded.
+
+        Returns:
+            The alert, or None when this side refused nothing by alert.
+
+        Raises:
+            If the shim symbol cannot be resolved.
+        """
+        return _alert(self._lib, "mts_ssl_sent_alert", self._ssl)
 
     def wants_read(self) raises -> Bool:
         """Reports whether the blocked TLS operation needs readability.

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `sent_alert()` on `TLSHandshake` and `TLSStream` returns the last alert
+  this side sent that refused the session, under the same rules as
+  `received_alert()`, so a server tells its own refusal of a client (for
+  example certificate_required) from a peer that went away.
 - `TLSContext.client(server_tickets_after_verify=True)` makes a TLS 1.3
   client that sent a certificate complete its handshake only on the
   server's verdict, the first post-handshake record. A session ticket
