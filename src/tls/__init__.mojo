@@ -36,6 +36,7 @@ def main() raises:
 from .tls import (
     PeerCertificate,
     SubjectAlternativeNames,
+    TLSAlert,
     TLSContext,
     TLSHandshake,
     TLSSession,

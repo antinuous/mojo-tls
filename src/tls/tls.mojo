@@ -201,6 +201,63 @@ struct PeerCertificate(Copyable, Movable):
 
 
 @fieldwise_init
+struct TLSAlert(Equatable, ImplicitlyCopyable, Movable, Writable):
+    """A fatal alert the peer sent, by its RFC 8446 description code.
+
+    A session records the last one it received. After a handshake step,
+    read or write raises, `received_alert()` tells a peer's rejection
+    (such as `certificate_required` for a missing client certificate) from
+    a transport failure. Warning-level alerts are not recorded.
+    """
+
+    var code: UInt8
+    """The alert description, RFC 8446 section 6."""
+
+    comptime bad_certificate = TLSAlert(42)
+    """The peer rejected the certificate as corrupt or unverifiable."""
+    comptime unsupported_certificate = TLSAlert(43)
+    """The peer does not support the certificate's type."""
+    comptime certificate_revoked = TLSAlert(44)
+    """The certificate was revoked by its signer."""
+    comptime certificate_expired = TLSAlert(45)
+    """The certificate has expired or is not yet valid."""
+    comptime certificate_unknown = TLSAlert(46)
+    """The peer could not accept the certificate for another reason."""
+    comptime unknown_ca = TLSAlert(48)
+    """The peer does not trust the certificate's issuer."""
+    comptime certificate_required = TLSAlert(116)
+    """The server required a client certificate and got none."""
+
+    def __eq__(self, other: Self) -> Bool:
+        """Compares alert codes.
+
+        Args:
+            other: The alert to compare with.
+
+        Returns:
+            True when both name the same description code.
+        """
+        return self.code == other.code
+
+    def write_to(self, mut writer: Some[Writer]):
+        """Writes the alert as `tls alert <code>`.
+
+        Args:
+            writer: The destination.
+        """
+        writer.write("tls alert ", self.code)
+
+
+def _received_alert(
+    lib: OwnedDLHandle, ssl: UInt64
+) raises -> Optional[TLSAlert]:
+    var code = Int(lib.get_function[c_int]("mts_ssl_received_alert")(ssl))
+    if code < 0:
+        return None
+    return TLSAlert(UInt8(code))
+
+
+@fieldwise_init
 struct TLSSession(Copyable, Movable):
     """Opaque TLS session ticket bytes for handshake resumption.
 
@@ -669,6 +726,17 @@ struct TLSHandshake(Movable):
         """
         return self._tcp.descriptor()
 
+    def received_alert(self) raises -> Optional[TLSAlert]:
+        """Returns the last fatal alert the peer sent, if any.
+
+        Returns:
+            The alert, or None when the peer sent no fatal alert.
+
+        Raises:
+            If the shim symbol cannot be resolved.
+        """
+        return _received_alert(self._lib, self._ssl)
+
     def wants_read(self) raises -> Bool:
         """Reports whether the next handshake step needs readability.
 
@@ -892,6 +960,17 @@ struct TLSStream(ReadinessStream):
             If the descriptor flags cannot be updated.
         """
         self._tcp.set_nonblocking(enabled)
+
+    def received_alert(self) raises -> Optional[TLSAlert]:
+        """Returns the last fatal alert the peer sent, if any.
+
+        Returns:
+            The alert, or None when the peer sent no fatal alert.
+
+        Raises:
+            If the shim symbol cannot be resolved.
+        """
+        return _received_alert(self._lib, self._ssl)
 
     def wants_read(self) raises -> Bool:
         """Reports whether the blocked TLS operation needs readability.

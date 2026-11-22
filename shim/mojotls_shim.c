@@ -85,6 +85,8 @@ typedef struct {
     mts_ctx *config;
     int hello;
     char requested_name[TLSEXT_MAXLEN_host_name + 1];
+    /* The description of the last fatal alert the peer sent, or -1. */
+    int received_alert;
 } mts_ssl;
 
 #define MTS_MAX_PEER_CERT_DER (1024 * 1024)
@@ -719,6 +721,16 @@ void mts_ctx_free(void *p) {
     mts_ctx_release(c);
 }
 
+/* close_notify and user_canceled arrive at warning level and are not
+ * recorded. TLS 1.3 ignores the level byte on receipt, but every TLS 1.3
+ * error alert is sent as fatal (RFC 8446 6.2). */
+static void mts_alert_seen(const SSL *ssl, int where, int ret) {
+    if ((where & SSL_CB_READ_ALERT) == 0) return;
+    if ((ret >> 8) != SSL3_AL_FATAL) return;
+    mts_ssl *s = (mts_ssl *)SSL_get_app_data(ssl);
+    s->received_alert = ret & 0xff;
+}
+
 void *mts_ssl_new(void *p, int fd) {
     mts_ctx *c = (mts_ctx *)p;
     mts_ssl *s = calloc(1, sizeof(mts_ssl));
@@ -731,7 +743,9 @@ void *mts_ssl_new(void *p, int fd) {
     s->config = c;
     s->hello = MTS_HELLO_FIRST;
     s->requested_name[0] = 0;
+    s->received_alert = -1;
     SSL_set_app_data(s->ssl, s);
+    SSL_set_info_callback(s->ssl, mts_alert_seen);
     atomic_fetch_add_explicit(&c->refs, 1, memory_order_relaxed);
     SSL_set_mode(s->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE |
                              SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
@@ -907,6 +921,11 @@ int mts_ssl_write(void *s, const unsigned char *buf, int len) {
     int result = n > 0 ? n : -SSL_get_error(ssl, n);
     mts_sigpipe_guard_end(&guard, io_errno);
     return result;
+}
+
+/* The description of the last fatal alert received, or -1 for none. */
+int mts_ssl_received_alert(void *s) {
+    return ((mts_ssl *)s)->received_alert;
 }
 
 int mts_ssl_wants_read(void *s) {

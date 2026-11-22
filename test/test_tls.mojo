@@ -4,7 +4,7 @@
 # typed WANT_READ and WANT_WRITE states, and clean EOF.
 
 from std.ffi import c_int, external_call
-from std.testing import assert_equal, assert_true
+from std.testing import assert_equal, assert_false, assert_true
 
 from net import (
     Poller,
@@ -15,7 +15,13 @@ from net import (
     is_timeout_error,
     is_would_block,
 )
-from tls import PeerCertificate, TLSContext, TLSSession, TLSStream
+from tls import (
+    PeerCertificate,
+    TLSAlert,
+    TLSContext,
+    TLSSession,
+    TLSStream,
+)
 
 
 comptime CA = "build/certs/ca.pem"
@@ -190,6 +196,35 @@ def test_required_client_certificate() raises:
     assert_equal(stream.negotiated_alpn(), "h2")
     stream.write_all("auth".as_bytes())
     assert_equal(String(from_utf8=stream.read_exact(4)), "auth")
+    assert_false(Bool(stream.received_alert()), "no alert on a good session")
+    stream.close()
+    reap(server[1])
+
+
+def test_missing_client_certificate_is_a_received_alert() raises:
+    # TLS 1.3: the client's handshake completes before the server checks
+    # for a client certificate, so the server's certificate_required alert
+    # reaches the client's first read.
+    var server = fork_tls_echo_server(
+        SERVER_CERT,
+        SERVER_KEY,
+        ["h2"],
+        client_ca=CA,
+        require_client_cert=True,
+    )
+    var ctx = TLSContext.client(ca_file=String(CA), alpn=["h2"])
+    var tcp = TCPStream.connect("127.0.0.1", server[0])
+    var stream = ctx.connect(tcp^, "localhost")
+    var raised = False
+    try:
+        stream.write_all("auth".as_bytes())
+        _ = stream.read_exact(4)
+    except:
+        raised = True
+    assert_true(raised, "a server requiring a certificate must reject")
+    var alert = stream.received_alert()
+    assert_true(Bool(alert), "the rejection is a received alert")
+    assert_equal(alert.value(), TLSAlert.certificate_required)
     stream.close()
     reap(server[1])
 
@@ -1061,6 +1096,7 @@ def test_write_timeout_after_wrap() raises:
 def main() raises:
     test_handshake_echo_alpn()
     test_required_client_certificate()
+    test_missing_client_certificate_is_a_received_alert()
     test_reject_untrusted_client_certificate()
     test_clean_eof()
     test_end_without_close_notify_is_a_typed_reset()
