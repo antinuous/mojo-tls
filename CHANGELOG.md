@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- A read that meets the end of the connection with no close_notify
+  raises mojo-net's typed `CONNECTION_RESET_ERROR`, as a TCP reset does;
+  check it with `is_connection_reset()`. It was the untyped "tls read
+  failed: ... unexpected eof while reading". A close_notify still reads
+  as a clean EOF of 0.
+
 ## 0.3.5 - 2026-10-13
 
 - Client hostname verification rejects partial wildcards

@@ -11,6 +11,7 @@ from net import (
     ReadinessStream,
     TCPListener,
     TCPStream,
+    is_connection_reset,
     is_timeout_error,
     is_would_block,
 )
@@ -235,6 +236,40 @@ def test_clean_eof() raises:
     stream.close()
     reap(server[1])
     _ = probe
+
+
+def test_end_without_close_notify_is_a_typed_reset() raises:
+    # A server that ends the connection with no close_notify may have cut
+    # off what it sent, so the read after its data raises the typed reset
+    # error rather than reading the clean EOF of 0.
+    var listener = TCPListener("127.0.0.1", 0)
+    var port = listener.local_port
+    var pid = external_call["fork", c_int]()
+    if pid == 0:
+        try:
+            var ctx = TLSContext.server(SERVER_CERT, SERVER_KEY)
+            var tcp = listener.accept()
+            var stream = ctx.accept(tcp^)
+            stream.write_all("x".as_bytes())
+        except:
+            pass
+        external_call["_exit", NoneType](c_int(0))
+    listener.close()
+
+    var ctx = TLSContext.client(ca_file=String(CA))
+    var tcp = TCPStream.connect("127.0.0.1", port)
+    var stream = ctx.connect(tcp^, "localhost")
+    assert_equal(String(from_utf8=stream.read_exact(1)), "x")
+    var buf = List[Byte](length=16, fill=0)
+    var reset = False
+    try:
+        _ = stream.read(buf)
+    except error:
+        assert_true(is_connection_reset(error), String(error))
+        reset = True
+    assert_true(reset, "an end without close_notify is not a clean EOF")
+    stream.close()
+    reap(pid)
 
 
 def test_clean_close_right_after_client_cert_handshake() raises:
@@ -1028,6 +1063,7 @@ def main() raises:
     test_required_client_certificate()
     test_reject_untrusted_client_certificate()
     test_clean_eof()
+    test_end_without_close_notify_is_a_typed_reset()
     test_clean_close_right_after_client_cert_handshake()
     test_reject_untrusted_ca()
     test_reject_wrong_hostname()

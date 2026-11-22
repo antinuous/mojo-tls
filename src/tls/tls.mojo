@@ -33,7 +33,13 @@ from std.os import getenv
 from std.pathlib import Path
 from std.sys import CompilationTarget
 
-from net import ReadinessStream, TCPStream, WOULD_BLOCK_ERROR, is_timeout_error
+from net import (
+    CONNECTION_RESET_ERROR,
+    ReadinessStream,
+    TCPStream,
+    WOULD_BLOCK_ERROR,
+    is_timeout_error,
+)
 from net.libc import os_error
 
 
@@ -47,6 +53,8 @@ comptime _MAX_PEER_SAN_BYTES = 64 * 1024
 comptime _MAX_PEER_SAN_VALUE = 4096
 comptime _MAX_SESSION_DER = 16 * 1024
 comptime _MAX_ALPN_PROTOCOL = 255
+comptime _PEER_CLOSED = -100
+"""The shim's `-MTS_PEER_CLOSED`: the stream ended with no close_notify."""
 
 
 def _shim_filename() -> String:
@@ -650,6 +658,8 @@ struct TLSStream(ReadinessStream):
             if self._tcp.nonblocking and is_timeout_error(err):
                 raise Error(WOULD_BLOCK_ERROR)
             raise err
+        if rc == _PEER_CLOSED:
+            raise Error(CONNECTION_RESET_ERROR)
         context += " failed"
         raise _shim_error(self._lib, context^)
 
@@ -719,6 +729,9 @@ struct TLSStream(ReadinessStream):
         Raises:
             On TLS or transport errors, including the typed timeout
             error when a read timeout on the underlying stream expires.
+            A peer that ends the connection without close_notify raises
+            the typed `CONNECTION_RESET_ERROR`, as a TCP reset does: the
+            data before it may be cut off, so it is not a clean close.
         """
         if len(buf) == 0:
             return 0

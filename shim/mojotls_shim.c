@@ -65,6 +65,12 @@ typedef struct {
 #define MTS_SAN_EMAIL 3
 #define MTS_SAN_IP 4
 
+/* A read that met the end of the TCP stream with no close_notify. It is not
+ * a clean EOF, since the peer's data before it may be cut off. OpenSSL 3
+ * reports it as SSL_ERROR_SSL with SSL_R_UNEXPECTED_EOF_WHILE_READING. The
+ * value lies outside SSL_get_error's classes. */
+#define MTS_PEER_CLOSED 100
+
 /* OpenSSL's socket BIO uses write(2), so a peer reset can raise SIGPIPE on
  * Linux before libssl returns SSL_ERROR_SYSCALL. Block the signal only on
  * the calling thread and consume it only when this operation created it.
@@ -441,8 +447,21 @@ int mts_ssl_accept(void *s) {
     return result;
 }
 
-/* Returns bytes read (> 0), 0 on clean TLS EOF (close_notify), or the
- * negated SSL_get_error class (< 0). */
+static int mts_read_failure(SSL *ssl, int n) {
+    int error = SSL_get_error(ssl, n);
+    if (error == SSL_ERROR_ZERO_RETURN) return 0;
+    if (error != SSL_ERROR_SSL) return -error;
+    unsigned long reason = ERR_peek_error();
+    if (ERR_GET_LIB(reason) != ERR_LIB_SSL) return -error;
+    if (ERR_GET_REASON(reason) != SSL_R_UNEXPECTED_EOF_WHILE_READING) {
+        return -error;
+    }
+    return -MTS_PEER_CLOSED;
+}
+
+/* Returns bytes read (> 0), 0 on clean TLS EOF (close_notify),
+ * -MTS_PEER_CLOSED on an end with no close_notify, or the negated
+ * SSL_get_error class (< 0). */
 int mts_ssl_read(void *s, unsigned char *buf, int len) {
     SSL *ssl = ((mts_ssl *)s)->ssl;
     mts_sigpipe_guard guard;
@@ -451,13 +470,7 @@ int mts_ssl_read(void *s, unsigned char *buf, int len) {
     errno = 0;
     int n = SSL_read(ssl, buf, len);
     int io_errno = errno;
-    int result;
-    if (n > 0) {
-        result = n;
-    } else {
-        int error = SSL_get_error(ssl, n);
-        result = error == SSL_ERROR_ZERO_RETURN ? 0 : -error;
-    }
+    int result = n > 0 ? n : mts_read_failure(ssl, n);
     mts_sigpipe_guard_end(&guard, io_errno);
     return result;
 }
