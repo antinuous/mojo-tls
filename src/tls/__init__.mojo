@@ -35,6 +35,7 @@ def main() raises:
 
 from .tls import (
     PeerCertificate,
+    PROTOCOL_ERROR,
     REJECTED_ERROR,
     SubjectAlternativeNames,
     TLSAlert,
@@ -42,5 +43,6 @@ from .tls import (
     TLSHandshake,
     TLSSession,
     TLSStream,
+    is_protocol_failure,
     is_rejection,
 )

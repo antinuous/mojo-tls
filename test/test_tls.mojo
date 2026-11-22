@@ -560,21 +560,6 @@ def test_certificate_client_times_out_without_a_verdict() raises:
     reap(server[1])
 
 
-def test_certificate_client_refuses_an_unbounded_verdict_wait() raises:
-    var server = fork_stalled_server()
-    var tcp = TCPStream.connect("127.0.0.1", server[0])
-    var ctx = certificate_client_context(CLIENT_CERT, CLIENT_KEY)
-    var refused = False
-    try:
-        _ = ctx.connect(tcp^, "localhost")
-    except error:
-        refused = "needs a read timeout" in String(error)
-        assert_true(refused, String(error))
-    assert_true(refused, "a blocking verdict wait needs a read timeout")
-    _ = external_call["kill", c_int](server[1], c_int(9))
-    reap(server[1])
-
-
 def test_an_alert_this_side_sends_is_not_received() raises:
     # The client refuses a self-signed server certificate and sends the
     # fatal alert; only the server records it as received.
@@ -1438,7 +1423,6 @@ def main() raises:
     test_certificate_client_takes_the_ticket_and_close_in_one_read()
     test_certificate_client_fails_when_the_server_ends_with_a_fin()
     test_certificate_client_times_out_without_a_verdict()
-    test_certificate_client_refuses_an_unbounded_verdict_wait()
     test_clean_eof()
     test_end_without_close_notify_is_a_typed_reset()
     test_reject_untrusted_ca()

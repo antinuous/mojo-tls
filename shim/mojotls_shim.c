@@ -117,6 +117,7 @@ typedef struct {
 #define MTS_PEER_CLOSED 100
 #define MTS_REJECTED 101
 #define MTS_UNBOUNDED 102
+#define MTS_PROTOCOL 103
 
 /* OpenSSL's socket BIO uses write(2), so a peer reset can raise SIGPIPE on
  * Linux before libssl returns SSL_ERROR_SYSCALL. Block the signal only on
@@ -327,13 +328,14 @@ void mts_ctx_await_verdict(void *p) {
     ((mts_ctx *)p)->await_verdict = 1;
 }
 
-/* TLS 1.3 tickets a server sends after a full handshake. */
-long mts_ctx_ticket_count(void *p) {
-    return (long)SSL_CTX_get_num_tickets(((mts_ctx *)p)->ctx);
-}
-
 int mts_ctx_require_client_cert(void *p, const char *ca_pem_path) {
     mts_ctx *c = (mts_ctx *)p;
+    /* Clients of mts_ctx_await_verdict complete on this server's tickets. */
+    if (SSL_CTX_get_num_tickets(c->ctx) == 0) abort();
+    if ((SSL_CTX_get_session_cache_mode(c->ctx) & SSL_SESS_CACHE_SERVER) == 0 &&
+        (SSL_CTX_get_options(c->ctx) & SSL_OP_NO_TICKET) != 0) {
+        abort();
+    }
     ERR_clear_error();
     if (SSL_CTX_load_verify_locations(c->ctx, ca_pem_path, NULL) != 1)
         return -1;
@@ -745,9 +747,10 @@ void mts_ctx_free(void *p) {
     mts_ctx_release(c);
 }
 
-/* close_notify and user_canceled arrive at warning level and are not
- * recorded. TLS 1.3 ignores the level byte on receipt, but every TLS 1.3
- * error alert is sent as fatal (RFC 8446 6.2). */
+/* close_notify and user_canceled end a session without refusing it and are
+ * never recorded. TLS 1.2 acts only on fatal alerts. TLS 1.3 ignores the
+ * level byte (RFC 8446 6) and fails on every other alert, so it records them
+ * at either level. */
 static void mts_alert_seen(const SSL *ssl, int where, int ret) {
     mts_ssl *s = (mts_ssl *)SSL_get_app_data(ssl);
     if ((where & SSL_CB_LOOP) != 0 && SSL_get_state(ssl) == TLS_ST_CW_CERT &&
@@ -755,8 +758,12 @@ static void mts_alert_seen(const SSL *ssl, int where, int ret) {
         s->sent_certificate = 1;
     }
     if ((where & SSL_CB_READ_ALERT) != SSL_CB_READ_ALERT) return;
-    if ((ret >> 8) != SSL3_AL_FATAL) return;
-    s->received_alert = ret & 0xff;
+    int level = ret >> 8;
+    int description = ret & 0xff;
+    if (description == SSL_AD_CLOSE_NOTIFY) return;
+    if (description == SSL_AD_USER_CANCELLED) return;
+    if (level != SSL3_AL_FATAL && SSL_version(ssl) != TLS1_3_VERSION) return;
+    s->received_alert = description;
 }
 
 static int mts_ticket_seen(SSL *ssl, SSL_SESSION *session) {
@@ -920,13 +927,14 @@ static int mts_verdict_failure(mts_ssl *s, int error, int io_errno) {
         }
         return -SSL_ERROR_SYSCALL;
     }
-    if (error != SSL_ERROR_SSL) return -error;
+    /* SSL_peek on a completed client handshake reports no other class. */
+    if (error != SSL_ERROR_SSL) abort();
     unsigned long reason = ERR_peek_error();
     if (ERR_GET_LIB(reason) == ERR_LIB_SSL &&
         ERR_GET_REASON(reason) == SSL_R_UNEXPECTED_EOF_WHILE_READING) {
         return -MTS_PEER_CLOSED;
     }
-    return -SSL_ERROR_SSL;
+    return -MTS_PROTOCOL;
 }
 
 static int mts_verdict_step(mts_ssl *s) {
@@ -971,18 +979,16 @@ static long mts_now_ms(void) {
 }
 
 static int mts_await_verdict(mts_ssl *s, int fd, int timeout_ms) {
-    long deadline_ms = timeout_ms < 0 ? -1 : mts_now_ms() + timeout_ms;
+    if (timeout_ms <= 0) abort();
+    long deadline_ms = mts_now_ms() + timeout_ms;
     int result = mts_verdict_step(s);
     while (result == -SSL_ERROR_WANT_READ || result == -SSL_ERROR_WANT_WRITE) {
-        int wait_ms = -1;
-        if (deadline_ms >= 0) {
-            long left_ms = deadline_ms - mts_now_ms();
-            if (left_ms <= 0) {
-                errno = EAGAIN;
-                return -SSL_ERROR_SYSCALL;
-            }
-            wait_ms = (int)left_ms;
+        long left_ms = deadline_ms - mts_now_ms();
+        if (left_ms <= 0) {
+            errno = EAGAIN;
+            return -SSL_ERROR_SYSCALL;
         }
+        int wait_ms = (int)left_ms;
         struct pollfd pfd;
         memset(&pfd, 0, sizeof(pfd));
         pfd.fd = fd;
@@ -1000,10 +1006,11 @@ static int mts_await_verdict(mts_ssl *s, int fd, int timeout_ms) {
 }
 
 /* Returns 0 when the session stands, -MTS_REJECTED on a fatal alert,
- * -MTS_PEER_CLOSED on an end before the verdict, -MTS_UNBOUNDED for a
- * blocking socket with no SO_RCVTIMEO, WANT_READ or WANT_WRITE while a
- * non-blocking verdict is pending, or the negated SSL_get_error class; a
- * blocking verdict past SO_RCVTIMEO is SYSCALL with EAGAIN. */
+ * -MTS_PEER_CLOSED on an end before the verdict, -MTS_PROTOCOL on a record
+ * that fails, -MTS_UNBOUNDED for a blocking socket with no SO_RCVTIMEO,
+ * WANT_READ or WANT_WRITE while a non-blocking verdict is pending, or
+ * SYSCALL with errno set (EAGAIN past SO_RCVTIMEO). Without the option it
+ * returns what mts_confirm_after_wait returns. */
 int mts_ssl_confirm_connect(void *p) {
     mts_ssl *s = (mts_ssl *)p;
     int awaits_verdict = s->config->await_verdict && s->sent_certificate &&

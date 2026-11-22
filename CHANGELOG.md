@@ -8,7 +8,8 @@
   accepts; a fatal alert raises `REJECTED_ERROR` (check it with
   `is_rejection()`); an end before any record raises
   `CONNECTION_RESET_ERROR`; a blocking socket's read timeout raises the
-  typed timeout, and a blocking socket without one is refused. Use it
+  typed timeout, and a blocking socket without one aborts; a record that
+  fails raises `PROTOCOL_ERROR` (check it with `is_protocol_failure()`). Use it
   only with servers that send their tickets after verifying the client
   certificate, as mojo-tls servers do. Off by default, which keeps the
   50 ms wait for a post-handshake alert.
@@ -16,7 +17,8 @@
   it would send no TLS 1.3 tickets, since such clients wait for them.
 - `received_alert()` records only alerts the peer sent. A fatal alert this
   side sent was recorded too, so a local failure could read as the peer's
-  rejection.
+  rejection. close_notify and user_canceled are never recorded, and a TLS
+  1.3 alert is recorded at either level, since TLS 1.3 ignores the level.
 - `TLSHandshake.verify_error()` returns the X509 error code when this
   side refused the peer's certificate, so a caller tells its own
   rejection from a peer's alert or a closed connection.

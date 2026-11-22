@@ -62,6 +62,27 @@ comptime _REJECTED = -101
 comptime _UNBOUNDED = -102
 """The shim's `-MTS_UNBOUNDED`: a blocking verdict wait with no read timeout."""
 
+comptime _PROTOCOL = -103
+"""The shim's `-MTS_PROTOCOL`: a record failed while awaiting the verdict."""
+
+comptime PROTOCOL_ERROR = "tls: the peer's record failed"
+"""The message of a verdict wait that met a record that failed to decode,
+decrypt, or parse, with no alert from the peer.
+"""
+
+
+def is_protocol_failure(e: Error) -> Bool:
+    """Reports whether an error is a record that failed in the verdict wait.
+
+    Args:
+        e: The error to inspect.
+
+    Returns:
+        True exactly for `PROTOCOL_ERROR`.
+    """
+    return String(e) == PROTOCOL_ERROR
+
+
 comptime REJECTED_ERROR = "tls: the peer rejected the handshake"
 """The message of a handshake the peer refused with a fatal alert.
 
@@ -343,9 +364,10 @@ struct TLSContext(Movable):
                 completes on the server's verdict: a ticket accepts, a fatal
                 alert raises `REJECTED_ERROR`, an end before any record
                 raises `CONNECTION_RESET_ERROR`, and a blocking socket's
-                read timeout raises the typed timeout. A blocking socket
-                must have a read timeout; a non-blocking caller bounds its
-                own wait. A server that sends no ticket never confirms such
+                read timeout raises the typed timeout, and a record that
+                fails raises `PROTOCOL_ERROR`. A blocking socket must have
+                a read timeout, or the process aborts; a non-blocking
+                caller bounds its own wait. A server that sends no ticket never confirms such
                 a client. Requires `cert_chain_pem`.
 
         Returns:
@@ -449,15 +471,6 @@ struct TLSContext(Movable):
             )(out._ctx, client_ca.as_c_string_span())
             if Int(rc) != 0:
                 raise _shim_error(out._lib, "tls: loading client CA")
-            var tickets = out._lib.get_function[Int]("mts_ctx_ticket_count")(
-                out._ctx
-            )
-            if tickets == 0:
-                abort(
-                    "tls: a server requiring client certificates sends"
-                    " tickets, which server_tickets_after_verify clients"
-                    " wait for"
-                )
         out._set_alpn(alpn)
         return out^
 
@@ -932,8 +945,10 @@ struct TLSHandshake(Movable):
                     raise Error(REJECTED_ERROR)
                 if Int(confirm) == _PEER_CLOSED:
                     raise Error(CONNECTION_RESET_ERROR)
+                if Int(confirm) == _PROTOCOL:
+                    raise Error(PROTOCOL_ERROR)
                 if Int(confirm) == _UNBOUNDED:
-                    raise Error(
+                    abort(
                         "tls: server_tickets_after_verify needs a read"
                         " timeout on a blocking socket"
                     )
