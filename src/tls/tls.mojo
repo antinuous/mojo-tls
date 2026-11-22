@@ -79,7 +79,6 @@ def _shim_path() raises -> String:
     var env = getenv("MOJO_TLS_SHIM")
     if env != "":
         candidates.append(env)
-    candidates.append(String("build/") + name)
     var prefix = getenv("CONDA_PREFIX")
     if prefix != "":
         candidates.append(prefix + "/lib/" + name)
