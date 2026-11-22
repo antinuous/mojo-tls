@@ -32,21 +32,33 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #ifdef __linux__
-#include <pthread.h>
 #include <signal.h>
 #include <time.h>
 #endif
 
+typedef struct mts_server_name {
+    char *host;
+    SSL_CTX *ctx;
+    struct mts_server_name *next;
+} mts_server_name;
+
+/* The servername callback reads names on handshake threads while add and
+ * remove may run on another thread, so names_lock guards the list. */
 typedef struct {
     SSL_CTX *ctx;
     unsigned char alpn_wire[256];
     int alpn_len;
     atomic_int refs;
+    pthread_mutex_t names_lock;
+    mts_server_name *names;
+    int names_installed;
 } mts_ctx;
 
 typedef struct {
@@ -142,6 +154,7 @@ static int mts_alpn_select(SSL *ssl, const unsigned char **out,
                            unsigned int inlen, void *arg) {
     (void)ssl;
     mts_ctx *c = (mts_ctx *)arg;
+    if (c->alpn_len == 0) return SSL_TLSEXT_ERR_NOACK;
     if (SSL_select_next_proto((unsigned char **)out, outlen, c->alpn_wire,
                               (unsigned int)c->alpn_len, in,
                               inlen) == OPENSSL_NPN_NEGOTIATED) {
@@ -159,6 +172,7 @@ void *mts_ctx_new_client(void) {
         return NULL;
     }
     atomic_init(&c->refs, 1);
+    pthread_mutex_init(&c->names_lock, NULL);
     SSL_CTX_set_min_proto_version(c->ctx, TLS1_2_VERSION);
     /* Resume with a ticket only. Early application data stays off. */
     SSL_CTX_set_session_cache_mode(c->ctx, SSL_SESS_CACHE_CLIENT);
@@ -186,6 +200,7 @@ void *mts_ctx_new_server(const char *cert_chain_pem, const char *key_pem) {
         return NULL;
     }
     atomic_init(&c->refs, 1);
+    pthread_mutex_init(&c->names_lock, NULL);
     SSL_CTX_set_min_proto_version(c->ctx, TLS1_2_VERSION);
     SSL_CTX_set_session_cache_mode(c->ctx, SSL_SESS_CACHE_SERVER);
     SSL_CTX_set_max_early_data(c->ctx, 0);
@@ -289,12 +304,196 @@ int mts_ctx_set_alpn(void *p, const unsigned char *wire, int len) {
     return 0;
 }
 
+static void mts_server_name_free(mts_server_name *n) {
+    SSL_CTX_free(n->ctx);
+    free(n->host);
+    free(n);
+}
+
 static void mts_ctx_release(mts_ctx *c) {
     if (!c) return;
     if (atomic_fetch_sub_explicit(&c->refs, 1, memory_order_acq_rel) != 1)
         return;
+    while (c->names) {
+        mts_server_name *next = c->names->next;
+        mts_server_name_free(c->names);
+        c->names = next;
+    }
+    pthread_mutex_destroy(&c->names_lock);
     SSL_CTX_free(c->ctx);
     free(c);
+}
+
+/* SSL_set_SSL_CTX takes its own reference on the child, so a handshake keeps
+ * a replaced or removed child alive. Sessions and tickets stay on the parent
+ * because SSL_set_SSL_CTX does not change the session context. No match
+ * keeps the parent's default certificate. */
+static int mts_servername_select(SSL *ssl, int *alert, void *arg) {
+    (void)alert;
+    mts_ctx *c = (mts_ctx *)arg;
+    const char *host = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+    if (!host || !host[0]) return SSL_TLSEXT_ERR_NOACK;
+    int matched = 0;
+    pthread_mutex_lock(&c->names_lock);
+    for (mts_server_name *n = c->names; n; n = n->next) {
+        if (strcasecmp(n->host, host) == 0) {
+            matched = SSL_set_SSL_CTX(ssl, n->ctx) != NULL;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&c->names_lock);
+    return matched ? SSL_TLSEXT_ERR_OK : SSL_TLSEXT_ERR_NOACK;
+}
+
+static int mts_ctx_use_pem_identity(SSL_CTX *ctx, const unsigned char *chain,
+                                    int chain_len, const unsigned char *key,
+                                    int key_len) {
+    BIO *bio = BIO_new_mem_buf(chain, chain_len);
+    if (!bio) return -1;
+    X509 *leaf = PEM_read_bio_X509(bio, NULL, mts_reject_password, NULL);
+    int rc = leaf && SSL_CTX_use_certificate(ctx, leaf) == 1 ? 0 : -1;
+    X509_free(leaf);
+    while (rc == 0) {
+        X509 *ca = PEM_read_bio_X509(bio, NULL, mts_reject_password, NULL);
+        if (!ca) {
+            unsigned long e = ERR_peek_last_error();
+            if (ERR_GET_LIB(e) == ERR_LIB_PEM &&
+                ERR_GET_REASON(e) == PEM_R_NO_START_LINE)
+                ERR_clear_error();
+            else
+                rc = -1;
+            break;
+        }
+        if (SSL_CTX_add0_chain_cert(ctx, ca) != 1) {
+            X509_free(ca);
+            rc = -1;
+        }
+    }
+    BIO_free(bio);
+    if (rc != 0) return -1;
+
+    bio = BIO_new_mem_buf(key, key_len);
+    if (!bio) return -1;
+    EVP_PKEY *pkey = PEM_read_bio_PrivateKey(bio, NULL, mts_reject_password,
+                                             NULL);
+    BIO_free(bio);
+    if (!pkey) return -1;
+    rc = SSL_CTX_use_PrivateKey(ctx, pkey) == 1 ? 0 : -1;
+    EVP_PKEY_free(pkey);
+    if (rc != 0 || SSL_CTX_check_private_key(ctx) != 1) return -1;
+    return 0;
+}
+
+/* The child copies the parent's protocol floor, session id context, verify
+ * mode, verify parameters, trust store, and client CA list. Its ALPN
+ * callback reads the parent's protocol list, so a later mts_ctx_set_alpn
+ * applies to every name. */
+static SSL_CTX *mts_server_name_ctx(mts_ctx *c, const unsigned char *chain,
+                                    int chain_len, const unsigned char *key,
+                                    int key_len) {
+    static const unsigned char sid_ctx[] = "mojo-tls";
+    SSL_CTX *parent = c->ctx;
+    SSL_CTX *child = SSL_CTX_new(TLS_server_method());
+    if (!child) return NULL;
+    STACK_OF(X509_NAME) *ca_names = SSL_CTX_get_client_CA_list(parent);
+    SSL_CTX_set_min_proto_version(child,
+                                  SSL_CTX_get_min_proto_version(parent));
+    SSL_CTX_set_max_early_data(child, 0);
+    SSL_CTX_set_alpn_select_cb(child, mts_alpn_select, c);
+    SSL_CTX_set_verify(child, SSL_CTX_get_verify_mode(parent),
+                       SSL_CTX_get_verify_callback(parent));
+    if (SSL_CTX_set_session_id_context(
+            child, sid_ctx, (unsigned int)(sizeof(sid_ctx) - 1)) != 1 ||
+        X509_VERIFY_PARAM_set1(SSL_CTX_get0_param(child),
+                               SSL_CTX_get0_param(parent)) != 1) {
+        SSL_CTX_free(child);
+        return NULL;
+    }
+    SSL_CTX_set1_cert_store(child, SSL_CTX_get_cert_store(parent));
+    if (ca_names && sk_X509_NAME_num(ca_names) > 0) {
+        STACK_OF(X509_NAME) *copy = SSL_dup_CA_list(ca_names);
+        if (!copy) {
+            SSL_CTX_free(child);
+            return NULL;
+        }
+        SSL_CTX_set_client_CA_list(child, copy);
+    }
+    if (mts_ctx_use_pem_identity(child, chain, chain_len, key, key_len) != 0) {
+        SSL_CTX_free(child);
+        return NULL;
+    }
+    return child;
+}
+
+/* Adds or replaces the certificate served when the client's SNI matches host
+ * (ASCII case-insensitive, exact). Returns 0 or -1 with the error queued. */
+int mts_ctx_add_server_name(void *server_ctx, const char *host,
+                            const unsigned char *chain_pem, int chain_len,
+                            const unsigned char *key_pem, int key_len) {
+    mts_ctx *c = (mts_ctx *)server_ctx;
+    ERR_clear_error();
+    if (!c || !host || !host[0] || !chain_pem || chain_len <= 0 || !key_pem ||
+        key_len <= 0) {
+        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
+        return -1;
+    }
+    SSL_CTX *child = mts_server_name_ctx(c, chain_pem, chain_len, key_pem,
+                                         key_len);
+    if (!child) return -1;
+
+    pthread_mutex_lock(&c->names_lock);
+    mts_server_name *n = c->names;
+    while (n && strcasecmp(n->host, host) != 0) n = n->next;
+    if (n) {
+        SSL_CTX_free(n->ctx);
+        n->ctx = child;
+    } else {
+        n = calloc(1, sizeof(mts_server_name));
+        char *copy = strdup(host);
+        if (!n || !copy) {
+            pthread_mutex_unlock(&c->names_lock);
+            free(n);
+            free(copy);
+            SSL_CTX_free(child);
+            ERR_raise(ERR_LIB_SSL, ERR_R_MALLOC_FAILURE);
+            return -1;
+        }
+        n->host = copy;
+        n->ctx = child;
+        n->next = c->names;
+        c->names = n;
+    }
+    if (!c->names_installed) {
+        SSL_CTX_set_tlsext_servername_callback(c->ctx, mts_servername_select);
+        SSL_CTX_set_tlsext_servername_arg(c->ctx, c);
+        c->names_installed = 1;
+    }
+    pthread_mutex_unlock(&c->names_lock);
+    ERR_clear_error();
+    return 0;
+}
+
+/* Returns 0 when host was removed and 1 when it was not configured. */
+int mts_ctx_remove_server_name(void *server_ctx, const char *host) {
+    mts_ctx *c = (mts_ctx *)server_ctx;
+    ERR_clear_error();
+    if (!c || !host) {
+        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_NULL_PARAMETER);
+        return -1;
+    }
+    mts_server_name *removed = NULL;
+    pthread_mutex_lock(&c->names_lock);
+    for (mts_server_name **link = &c->names; *link; link = &(*link)->next) {
+        if (strcasecmp((*link)->host, host) == 0) {
+            removed = *link;
+            *link = removed->next;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&c->names_lock);
+    if (!removed) return 1;
+    mts_server_name_free(removed);
+    return 0;
 }
 
 void mts_ctx_free(void *p) {
@@ -507,6 +706,14 @@ int mts_ssl_get_alpn(void *s, unsigned char *buf, int cap) {
     if (!d || (int)l > cap) return 0;
     memcpy(buf, d, l);
     return (int)l;
+}
+
+/* The client's SNI host name, or "" when none was sent. The string is owned
+ * by the SSL and lives until mts_ssl_free. */
+const char *mts_ssl_server_name(void *s) {
+    const char *name =
+        SSL_get_servername(((mts_ssl *)s)->ssl, TLSEXT_NAMETYPE_host_name);
+    return name ? name : "";
 }
 
 int mts_ssl_version(void *s, char *buf, int cap) {

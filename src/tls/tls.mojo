@@ -107,6 +107,20 @@ def _shim_error(lib: OwnedDLHandle, var context: String) -> Error:
     return Error(context^)
 
 
+def _server_name(lib: OwnedDLHandle, ssl: UInt64) raises -> String:
+    # The shim returns a NUL-terminated string owned by the SSL object.
+    var address = lib.get_function[UInt64]("mts_ssl_server_name")(ssl)
+    var name = List[Byte]()
+    var cursor = Pointer[UInt8, MutUntrackedOrigin](
+        unsafe_from_address=Int(address)
+    )
+    var index = 0
+    while cursor.unsafe_offset(index)[] != 0:
+        name.append(cursor.unsafe_offset(index)[])
+        index += 1
+    return String(from_utf8=name)
+
+
 def _alpn_wire(protocols: List[String]) raises -> List[Byte]:
     # RFC 7301 wire format: length-prefixed protocol names.
     var out = List[Byte]()
@@ -344,6 +358,64 @@ struct TLSContext(Movable):
         if Int(rc) != 0:
             raise _shim_error(self._lib, "tls: ALPN configuration")
 
+    def add_server_name(
+        self,
+        host: StringSpan,
+        chain_pem: Span[Byte, _],
+        key_pem: Span[Byte, _],
+    ) raises:
+        """Serves a certificate to clients whose SNI matches `host`.
+
+        Matching is exact and ASCII case-insensitive. Adding a host again
+        replaces its certificate for new handshakes. Clients without SNI or
+        with an unknown name receive the context's default certificate. The
+        name shares this context's ALPN, protocol floor, and client
+        certificate settings.
+
+        Args:
+            host: The DNS name to match against the client's SNI.
+            chain_pem: PEM leaf certificate followed by any intermediates.
+            key_pem: PEM unencrypted private key for the leaf.
+
+        Raises:
+            If this is not a server context or the certificate or key is
+            invalid or mismatched.
+        """
+        if not self._is_server:
+            raise Error("tls: server names require a server context")
+        var name = String(host)
+        var rc = self._lib.get_function[c_int]("mts_ctx_add_server_name")(
+            self._ctx,
+            name.as_c_string_slice(),
+            chain_pem.unsafe_ptr(),
+            c_int(len(chain_pem)),
+            key_pem.unsafe_ptr(),
+            c_int(len(key_pem)),
+        )
+        if Int(rc) != 0:
+            raise _shim_error(self._lib, "tls: loading server name identity")
+
+    def remove_server_name(self, host: StringSpan) raises:
+        """Stops serving the certificate added for `host`.
+
+        Handshakes already using it keep it. Removing an unknown host does
+        nothing.
+
+        Args:
+            host: The name passed to `add_server_name`.
+
+        Raises:
+            If this is not a server context.
+        """
+        if not self._is_server:
+            raise Error("tls: server names require a server context")
+        var name = String(host)
+        var rc = self._lib.get_function[c_int]("mts_ctx_remove_server_name")(
+            self._ctx, name.as_c_string_slice()
+        )
+        if Int(rc) < 0:
+            raise _shim_error(self._lib, "tls: removing server name")
+
     def connect(
         self,
         var tcp: TCPStream,
@@ -559,6 +631,22 @@ struct TLSHandshake(Movable):
             True when `finish()` may be called.
         """
         return self._complete
+
+    def server_name(self) raises -> String:
+        """Returns the SNI host name the client sent.
+
+        On a server handshake this is available once the ClientHello has
+        been processed. On a client handshake it is the name requested.
+
+        Returns:
+            The host name, or an empty string when none was sent.
+
+        Raises:
+            If the handshake is closed or the shim symbol cannot be resolved.
+        """
+        if not self._open:
+            raise Error("tls: server name requested after close")
+        return _server_name(self._lib, self._ssl)
 
     def advance(mut self) raises -> Bool:
         """Performs one handshake step without hiding readiness direction.
@@ -852,6 +940,19 @@ struct TLSStream(ReadinessStream):
         )
         buf.shrink(Int(n))
         return String(from_utf8=buf)
+
+    def server_name(self) raises -> String:
+        """Returns the SNI host name the client sent during the handshake.
+
+        Returns:
+            The host name, or an empty string when none was sent.
+
+        Raises:
+            If the stream is closed or the shim symbol cannot be resolved.
+        """
+        if not self._open:
+            raise Error("tls: server name requested after close")
+        return _server_name(self._lib, self._ssl)
 
     def version(self) raises -> String:
         """Returns the negotiated protocol version, e.g. "TLSv1.3".
