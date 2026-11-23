@@ -92,7 +92,8 @@ enum {
     MTS_END_PEER_RESET,
     MTS_END_PEER_ALERT,
     MTS_END_LOCAL_ALERT,
-    MTS_END_LOCAL_FAILURE
+    MTS_END_LOCAL_FAILURE,
+    MTS_END_TRANSPORT_ERROR
 };
 
 typedef struct {
@@ -778,8 +779,9 @@ static void mts_alert_seen(const SSL *ssl, int where, int ret) {
  * fatal alert it received, and SSL_R_UNEXPECTED_EOF_WHILE_READING for a TCP
  * end without close_notify. After that end it writes decode_error to the
  * closed peer, which ends nothing, so the call's first queued reason is
- * read before any alert this side wrote. A class that is no end (WANT_*,
- * a timeout) decides nothing. */
+ * read before any alert this side wrote. The socket BIO reports EAGAIN and
+ * EINTR as WANT_*, which is no end and decides nothing; any other errno
+ * under SYSCALL is the transport failing. */
 static void mts_end_decide(mts_ssl *s, int error, int io_errno) {
     if (s->end_kind != MTS_END_NONE) return;
     int kind = MTS_END_NONE;
@@ -787,6 +789,9 @@ static void mts_end_decide(mts_ssl *s, int error, int io_errno) {
     if (error == SSL_ERROR_ZERO_RETURN) kind = MTS_END_PEER_CLOSED;
     if (error == SSL_ERROR_SYSCALL && io_errno == 0) {
         kind = MTS_END_PEER_CLOSED;
+    }
+    if (error == SSL_ERROR_SYSCALL && io_errno != 0) {
+        kind = MTS_END_TRANSPORT_ERROR;
     }
     if (error == SSL_ERROR_SYSCALL &&
         (io_errno == ECONNRESET || io_errno == EPIPE)) {
@@ -1000,11 +1005,14 @@ static int mts_verdict_step(mts_ssl *s) {
     int io_errno = errno;
     int error = n > 0 ? SSL_ERROR_NONE : SSL_get_error(s->ssl, n);
     /* A ticket is the verdict even when the same read then meets an end
-     * or an error; the stream's next read reports those. */
+     * or an error. That end is decided here, since libssl reports it to
+     * no later call; the stream's next read raises it. */
+    int pending = error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE;
     int result = 0;
+    if (n <= 0 && !pending && s->ticket_seen) {
+        mts_end_decide(s, error, io_errno);
+    }
     if (n <= 0 && !s->ticket_seen) {
-        int pending =
-            error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE;
         result = pending ? -error : mts_verdict_failure(s, error, io_errno);
     }
     mts_sigpipe_guard_end(&guard, io_errno);
@@ -1319,7 +1327,6 @@ int mts_ssl_set_session(void *s, const unsigned char *der, int len,
 int mts_ssl_session_reused(void *s) {
     return SSL_session_reused(((mts_ssl *)s)->ssl) ? 1 : 0;
 }
-
 
 /* Returns the DER length of the peer's leaf certificate, 0 when the peer did
  * not present one, or a negative value on encoding or size failure. The X509

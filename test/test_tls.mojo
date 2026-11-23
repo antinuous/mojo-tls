@@ -603,12 +603,9 @@ def step_until_typed_error(mut handshake: TLSHandshake) raises -> Error:
     return Error()
 
 
-def shut_write(peer: TCPStream) raises:
+def shut_write(fd: c_int) raises:
     comptime SHUT_WR = 1
-    assert_equal(
-        external_call["shutdown", c_int](peer.descriptor(), c_int(SHUT_WR)),
-        0,
-    )
+    assert_equal(external_call["shutdown", c_int](fd, c_int(SHUT_WR)), 0)
 
 
 def test_a_peer_alert_before_the_end_ends_the_handshake() raises:
@@ -617,7 +614,7 @@ def test_a_peer_alert_before_the_end_ends_the_handshake() raises:
     var pair = raw_peer_after_hello()
     var alert: List[Byte] = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]
     pair.peer.write_all(alert)
-    shut_write(pair.peer)
+    shut_write(pair.peer.descriptor())
     _ = step_until_typed_error(pair.client)
     assert_end(pair.client.end_cause(), TLSEnd.peer_alert, 40)
     pair.peer.close()
@@ -648,7 +645,7 @@ def test_a_peer_reset_ends_the_handshake() raises:
 
 
 def test_a_local_alert_before_the_peer_end_stands() raises:
-    # A raw client writes a handshake record that is no ClientHello; the
+    # A raw client writes a ClientHello record with an empty body; the
     # server's step refuses it with an alert, and only then does the raw
     # client end the stream, so the server's first end is its own alert.
     var listener = TCPListener("127.0.0.1", 0)
@@ -666,7 +663,7 @@ def test_a_local_alert_before_the_peer_end_stands() raises:
     var end = server.end_cause()
     assert_true(Bool(end), "the server has ended")
     assert_equal(end.value().kind, TLSEnd.local_alert)
-    shut_write(peer)
+    shut_write(peer.descriptor())
     try:
         _ = server.advance()
     except:
@@ -675,11 +672,27 @@ def test_a_local_alert_before_the_peer_end_stands() raises:
     peer.close()
 
 
+def test_a_refusal_is_local_even_when_its_alert_cannot_leave() raises:
+    # The client shuts its own write side after its ClientHello, then the
+    # raw peer writes a ServerHello record with an empty body. The client
+    # refuses it; its decode_error meets the closed write side, and the
+    # refusal is still this side's alert.
+    var pair = raw_peer_after_hello()
+    shut_write(pair.client.descriptor())
+    var record: List[Byte] = [
+        0x16, 0x03, 0x03, 0x00, 0x04, 0x02, 0x00, 0x00, 0x00
+    ]
+    pair.peer.write_all(record)
+    _ = step_until_typed_error(pair.client)
+    assert_end(pair.client.end_cause(), TLSEnd.local_alert, 50)
+    pair.peer.close()
+
+
 def test_a_peer_end_before_the_local_alert_is_a_close() raises:
     # The raw peer ends the stream with no alert before the client steps.
     # libssl then writes decode_error to the closed peer, after the end.
     var pair = raw_peer_after_hello()
-    shut_write(pair.peer)
+    shut_write(pair.peer.descriptor())
     var error = step_until_typed_error(pair.client)
     assert_true(is_connection_reset(error), String(error))
     assert_end(pair.client.end_cause(), TLSEnd.peer_closed, 0)
@@ -1516,6 +1529,7 @@ def main() raises:
     test_a_peer_alert_before_the_end_ends_the_handshake()
     test_a_peer_reset_ends_the_handshake()
     test_a_local_alert_before_the_peer_end_stands()
+    test_a_refusal_is_local_even_when_its_alert_cannot_leave()
     test_a_peer_end_before_the_local_alert_is_a_close()
     test_reject_untrusted_client_certificate()
     test_certificate_client_completes_on_the_ticket()

@@ -270,7 +270,11 @@ struct TLSEnd(Equatable, ImplicitlyCopyable, Movable, Writable):
     comptime local_alert: UInt8 = 4
     """This side refused the peer with a fatal alert."""
     comptime local_failure: UInt8 = 5
-    """This side failed with no alert written."""
+    """This side failed with no alert, such as an internal error. A refusal
+    of the peer is `local_alert` even when its alert cannot be written."""
+    comptime transport_error: UInt8 = 6
+    """The transport failed other than by a reset, such as a timeout of
+    the TCP connection; the raised error carries the errno."""
 
     def __eq__(self, other: Self) -> Bool:
         """Compares kind and alert.
@@ -297,8 +301,10 @@ struct TLSEnd(Equatable, ImplicitlyCopyable, Movable, Writable):
             writer.write("peer alert ", self.alert)
         elif self.kind == Self.local_alert:
             writer.write("local alert ", self.alert)
-        else:
+        elif self.kind == Self.local_failure:
             writer.write("local failure")
+        else:
+            writer.write("transport error")
 
 
 def _end(lib: OwnedDLHandle, ssl: UInt64) raises -> Optional[TLSEnd]:

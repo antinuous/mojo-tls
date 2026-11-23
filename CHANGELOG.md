@@ -4,8 +4,8 @@
 
 - `end_cause()` on `TLSHandshake` and `TLSStream` returns a `TLSEnd`, the
   one thing that ended the session: `peer_closed`, `peer_reset`,
-  `peer_alert` or `local_alert` with the alert description, or
-  `local_failure`. The session decides it once, when the step, read or
+  `peer_alert` or `local_alert` with the alert description,
+  `local_failure`, or `transport_error`. The session decides it once, when the step, read or
   write that met the end returns, and the first end stands; a peer's TCP
   end stays `peer_closed` although libssl then writes decode_error to the
   closed peer. It replaces `received_alert()` and `TLSAlert`, and the
