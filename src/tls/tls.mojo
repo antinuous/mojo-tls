@@ -268,10 +268,11 @@ struct TLSEnd(Equatable, ImplicitlyCopyable, Movable, Writable):
     comptime peer_alert: UInt8 = 3
     """The peer sent a fatal alert."""
     comptime local_alert: UInt8 = 4
-    """This side refused the peer with a fatal alert."""
+    """This side refused the peer with a fatal alert it handed to the
+    transport, whether or not the write reached the peer."""
     comptime local_failure: UInt8 = 5
-    """This side failed with no alert, such as an internal error. A refusal
-    of the peer is `local_alert` even when its alert cannot be written."""
+    """This side failed with no alert handed to the transport: an internal
+    error, or a refusal whose alert waits behind a blocked write."""
     comptime transport_error: UInt8 = 6
     """The transport failed other than by a reset, such as a timeout of
     the TCP connection; the raised error carries the errno."""

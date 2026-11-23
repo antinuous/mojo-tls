@@ -1005,8 +1005,8 @@ static int mts_verdict_step(mts_ssl *s) {
     int io_errno = errno;
     int error = n > 0 ? SSL_ERROR_NONE : SSL_get_error(s->ssl, n);
     /* A ticket is the verdict even when the same read then meets an end
-     * or an error. That end is decided here, since libssl reports it to
-     * no later call; the stream's next read raises it. */
+     * or an error. That end is decided here, since libssl's later calls
+     * report only its error state; the stream's next read raises. */
     int pending = error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE;
     int result = 0;
     if (n <= 0 && !pending && s->ticket_seen) {
