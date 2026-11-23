@@ -2,14 +2,14 @@
 
 ## Unreleased
 
-- `end_cause()` on `TLSHandshake` and `TLSStream` returns a `TLSEnd`, the
-  one thing that ended the session: `peer_closed`, `peer_reset`,
-  `peer_alert` or `local_alert` with the alert description,
-  `local_failure`, or `transport_error`. The session decides it once,
-  when the step, read or write that met the end returns, and the first
-  end stands; a peer's TCP end stays `peer_closed` although libssl then
-  writes decode_error to the closed peer. It replaces `received_alert()` and `TLSAlert`, and the
-  unreleased `sent_alert()` and `verify_error()`.
+- `end_cause()` on `TLSHandshake` and `TLSStream` returns a `TLSEnd`, the one
+  thing that ended the session: `peer_closed`, `peer_reset`, `peer_alert` or
+  `local_alert` with the alert description, `local_failure`, or
+  `transport_error`. The session decides it once, when the step, read or write
+  that met the end returns, and the first end stands; a peer's TCP end stays
+  `peer_closed` although libssl then writes decode_error to the closed peer. It
+  replaces `received_alert()` and `TLSAlert`, and the unreleased `sent_alert()`
+  and `verify_error()`.
 - A handshake step that meets the peer's end of the connection raises
   `CONNECTION_RESET_ERROR`, as a read does.
 - `TLSContext.client(server_tickets_after_verify=True)` makes a TLS 1.3
